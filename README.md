@@ -54,6 +54,13 @@ Analyze a Rust crate and write JSON:
 coviz ./src --language rust --format json --output graph.json
 ```
 
+Open a quick local browser viewer. The command writes temporary files under
+`/tmp/coviz-*`, starts a localhost server, and opens the default browser:
+
+```bash
+coviz quick ./src --language rust
+```
+
 Use automatic language detection and stdout:
 
 ```bash
