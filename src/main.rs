@@ -10,9 +10,10 @@ use std::{
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use coviz::{
-    AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot, render_html,
-    render_json,
+    Analysis, AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot,
+    render_html, render_json,
 };
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -145,6 +146,11 @@ fn run_quick(args: QuickArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to write quick viewer in {}", workspace.display()))?;
     fs::write(workspace.join("graph.json"), render_json(&analysis)?)
         .with_context(|| format!("failed to write graph.json in {}", workspace.display()))?;
+    fs::write(
+        workspace.join("source.json"),
+        render_source_index(&analysis, &args.input)?,
+    )
+    .with_context(|| format!("failed to write source.json in {}", workspace.display()))?;
     fs::write(workspace.join("graph.dot"), &dot)
         .with_context(|| format!("failed to write graph.dot in {}", workspace.display()))?;
     if let Err(error) = render_quick_svg(&workspace) {
@@ -176,6 +182,73 @@ fn create_quick_workspace() -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create {}", workspace.display()))?;
     Ok(workspace)
+}
+
+#[derive(Debug, Serialize)]
+struct SourceIndex {
+    functions: Vec<FunctionSource>,
+}
+
+#[derive(Debug, Serialize)]
+struct FunctionSource {
+    id: String,
+    file: String,
+    line: usize,
+    snippet_start: usize,
+    lines: Vec<SourceLine>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceLine {
+    number: usize,
+    text: String,
+}
+
+fn render_source_index(analysis: &Analysis, input: &Path) -> anyhow::Result<String> {
+    let input = input
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", input.display()))?;
+    let root = if input.is_file() {
+        input
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    } else {
+        input
+    };
+
+    let mut functions = Vec::with_capacity(analysis.functions.len());
+    for function in &analysis.functions {
+        let path = root.join(&function.file);
+        let source = fs::read(&path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let snippet_start = function.line.saturating_sub(5).max(1);
+        let snippet_end = function.line + 5;
+        let lines = source
+            .lines()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                let number = index + 1;
+                (snippet_start..=snippet_end)
+                    .contains(&number)
+                    .then(|| SourceLine {
+                        number,
+                        text: text.to_string(),
+                    })
+            })
+            .collect();
+
+        functions.push(FunctionSource {
+            id: function.id.clone(),
+            file: function.file.clone(),
+            line: function.line,
+            snippet_start,
+            lines,
+        });
+    }
+
+    Ok(serde_json::to_string_pretty(&SourceIndex { functions })?)
 }
 
 fn render_quick_svg(workspace: &Path) -> anyhow::Result<()> {
@@ -243,6 +316,10 @@ fn handle_quick_request(mut stream: TcpStream, workspace: &Path) -> anyhow::Resu
         }
         "/graph.json" => file_response(
             workspace.join("graph.json"),
+            "application/json; charset=utf-8",
+        )?,
+        "/source.json" => file_response(
+            workspace.join("source.json"),
             "application/json; charset=utf-8",
         )?,
         "/graph.dot" => file_response(
