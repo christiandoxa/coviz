@@ -2,12 +2,20 @@
 name = "coviz"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Source code logic and call graph visualizer for Go and Rust."
 license = "Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/coviz"
+homepage = "https://github.com/christiandoxa/coviz"
+repository = "https://github.com/christiandoxa/coviz"
 keywords = ["callgraph", "visualization", "golang", "rust", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github/",
+    ".idea/",
+    "target/",
+]
 
 [dependencies]
 anyhow = "1.0.102"

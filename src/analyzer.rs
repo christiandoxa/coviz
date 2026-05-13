@@ -23,10 +23,42 @@ struct FunctionKey {
     name: String,
 }
 
+/// Analyzer behavior toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalysisOptions {
+    pub include_tests: bool,
+}
+
+impl Default for AnalysisOptions {
+    fn default() -> Self {
+        Self {
+            include_tests: true,
+        }
+    }
+}
+
+impl AnalysisOptions {
+    /// Exclude common test files and Rust `#[cfg(test)]` modules.
+    pub fn without_tests() -> Self {
+        Self {
+            include_tests: false,
+        }
+    }
+}
+
 /// Analyze a source file or directory and resolve calls between discovered functions.
 pub fn analyze_path(input: impl AsRef<Path>, language: Option<Language>) -> Result<Analysis> {
+    analyze_path_with_options(input, language, AnalysisOptions::default())
+}
+
+/// Analyze source with explicit options.
+pub fn analyze_path_with_options(
+    input: impl AsRef<Path>,
+    language: Option<Language>,
+    options: AnalysisOptions,
+) -> Result<Analysis> {
     let input = input.as_ref();
-    let files = discover_files(input, language)?;
+    let files = discover_files(input, language, options)?;
     let mut definitions = Vec::new();
 
     for file in &files {
@@ -38,6 +70,7 @@ pub fn analyze_path(input: impl AsRef<Path>, language: Option<Language>) -> Resu
             &source,
             file.language,
             &file.display_path,
+            options,
             &mut definitions,
         );
     }
@@ -79,6 +112,7 @@ pub fn analyze_path(input: impl AsRef<Path>, language: Option<Language>) -> Resu
             &source,
             file.language,
             &file.display_path,
+            options,
             None,
             &id_by_definition,
             &id_by_name,
@@ -97,7 +131,11 @@ pub fn analyze_path(input: impl AsRef<Path>, language: Option<Language>) -> Resu
     Ok(Analysis { functions, calls })
 }
 
-fn discover_files(input: &Path, language: Option<Language>) -> Result<Vec<SourceFile>> {
+fn discover_files(
+    input: &Path,
+    language: Option<Language>,
+    options: AnalysisOptions,
+) -> Result<Vec<SourceFile>> {
     if !input.exists() {
         bail!("input path does not exist: {}", input.display());
     }
@@ -110,12 +148,15 @@ fn discover_files(input: &Path, language: Option<Language>) -> Result<Vec<Source
 
     let mut files = Vec::new();
     if input.is_file() {
-        maybe_push_source_file(input, root, language, &mut files)?;
+        maybe_push_source_file(input, root, language, options, &mut files)?;
     } else {
         for entry in WalkDir::new(input).sort_by_file_name() {
             let entry = entry.with_context(|| format!("failed to walk {}", input.display()))?;
+            if should_skip_entry(entry.path(), root, options) {
+                continue;
+            }
             if entry.file_type().is_file() {
-                maybe_push_source_file(entry.path(), root, language, &mut files)?;
+                maybe_push_source_file(entry.path(), root, language, options, &mut files)?;
             }
         }
     }
@@ -128,6 +169,7 @@ fn maybe_push_source_file(
     path: &Path,
     root: &Path,
     requested_language: Option<Language>,
+    options: AnalysisOptions,
     files: &mut Vec<SourceFile>,
 ) -> Result<()> {
     let Some(detected_language) = Language::from_extension(path) else {
@@ -138,12 +180,50 @@ fn maybe_push_source_file(
         return Ok(());
     }
 
+    let display_path = display_path(path, root)?;
+    if !options.include_tests && is_test_file(&display_path, detected_language) {
+        return Ok(());
+    }
+
     files.push(SourceFile {
         path: path.to_path_buf(),
-        display_path: display_path(path, root)?,
+        display_path,
         language: detected_language,
     });
     Ok(())
+}
+
+fn should_skip_entry(path: &Path, root: &Path, options: AnalysisOptions) -> bool {
+    if options.include_tests {
+        return false;
+    }
+
+    let Ok(display_path) = display_path(path, root) else {
+        return false;
+    };
+
+    display_path
+        .split('/')
+        .any(|component| matches!(component, ".git" | "target" | "tests"))
+}
+
+fn is_test_file(display_path: &str, language: Language) -> bool {
+    if display_path
+        .split('/')
+        .any(|component| component == "tests")
+    {
+        return true;
+    }
+
+    match language {
+        Language::Go => display_path.ends_with("_test.go"),
+        Language::Rust => {
+            display_path.ends_with("_test.rs")
+                || display_path.ends_with("_tests.rs")
+                || display_path.ends_with("/test.rs")
+                || display_path.ends_with("/tests.rs")
+        }
+    }
 }
 
 fn display_path(path: &Path, root: &Path) -> Result<String> {
@@ -178,8 +258,13 @@ fn collect_definitions(
     source: &[u8],
     language: Language,
     file: &str,
+    options: AnalysisOptions,
     definitions: &mut Vec<FunctionKey>,
 ) {
+    if should_skip_node(language, node, source, options) {
+        return;
+    }
+
     if is_function_definition(language, node)
         && let Some(name) = definition_name(node, source)
     {
@@ -192,7 +277,7 @@ fn collect_definitions(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_definitions(child, source, language, file, definitions);
+        collect_definitions(child, source, language, file, options, definitions);
     }
 }
 
@@ -202,11 +287,16 @@ fn collect_calls(
     source: &[u8],
     language: Language,
     file: &str,
+    options: AnalysisOptions,
     current_function: Option<&str>,
     id_by_definition: &BTreeMap<FunctionKey, String>,
     id_by_name: &BTreeMap<String, String>,
     calls: &mut Vec<Call>,
 ) {
+    if should_skip_node(language, node, source, options) {
+        return;
+    }
+
     let mut active_function = current_function;
     if is_function_definition(language, node)
         && let Some(name) = definition_name(node, source)
@@ -238,6 +328,7 @@ fn collect_calls(
             source,
             language,
             file,
+            options,
             active_function,
             id_by_definition,
             id_by_name,
@@ -251,6 +342,53 @@ fn is_function_definition(language: Language, node: Node<'_>) -> bool {
         Language::Go => matches!(node.kind(), "function_declaration" | "method_declaration"),
         Language::Rust => node.kind() == "function_item",
     }
+}
+
+fn should_skip_node(
+    language: Language,
+    node: Node<'_>,
+    source: &[u8],
+    options: AnalysisOptions,
+) -> bool {
+    !options.include_tests && language == Language::Rust && has_cfg_test_attribute(node, source)
+}
+
+fn has_cfg_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
+    if node_has_cfg_test_attribute(node, source) {
+        return true;
+    }
+
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        if sibling.end_position().row + 1 < node.start_position().row {
+            break;
+        }
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        if node_text(sibling, source).is_some_and(|text| text.contains("cfg(test)")) {
+            return true;
+        }
+        previous = sibling.prev_named_sibling();
+    }
+
+    false
+}
+
+fn node_has_cfg_test_attribute(node: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "attribute_item"
+            && node_text(child, source).is_some_and(|text| text.contains("cfg(test)"))
+        {
+            return true;
+        }
+        if child.kind() != "attribute_item" {
+            break;
+        }
+    }
+
+    false
 }
 
 fn definition_name(node: Node<'_>, source: &[u8]) -> Option<String> {

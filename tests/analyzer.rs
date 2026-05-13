@@ -1,4 +1,6 @@
-use coviz::{Language, analyze_path, render_dot, render_json};
+use coviz::{
+    AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot, render_json,
+};
 
 #[test]
 fn analyzes_go_fixture() {
@@ -77,8 +79,37 @@ fn renders_outputs_from_analysis() {
 fn analyzes_mixed_directory_when_language_is_unspecified() {
     let analysis = analyze_path("tests/fixtures", None).unwrap();
 
-    assert_eq!(analysis.functions.len(), 8);
-    assert_eq!(analysis.calls.len(), 6);
+    assert_eq!(analysis.functions.len(), 14);
+    assert_eq!(analysis.calls.len(), 10);
+}
+
+#[test]
+fn can_exclude_test_files_and_cfg_test_code() {
+    let analysis = analyze_path_with_options(
+        "tests/fixtures/filter-tests",
+        None,
+        AnalysisOptions::without_tests(),
+    )
+    .unwrap();
+
+    let names: Vec<_> = analysis
+        .functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert_eq!(names, ["main", "helper", "production", "shared"]);
+    assert!(
+        analysis
+            .functions
+            .iter()
+            .all(|function| !function.file.ends_with("_test.go"))
+    );
+    assert!(
+        analysis
+            .functions
+            .iter()
+            .all(|function| function.name != "hidden_test")
+    );
 }
 
 fn function_name<'a>(analysis: &'a coviz::Analysis, id: &str) -> &'a str {

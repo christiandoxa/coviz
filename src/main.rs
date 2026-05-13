@@ -9,7 +9,10 @@ use std::{
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use coviz::{Language, analyze_path, render_dot, render_html, render_json};
+use coviz::{
+    AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot, render_html,
+    render_json,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +71,10 @@ struct QuickArgs {
     /// Do not open the default browser.
     #[arg(long)]
     no_open: bool,
+
+    /// Include test files and Rust #[cfg(test)] code.
+    #[arg(long)]
+    include_tests: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -123,8 +130,14 @@ fn run_graph(args: GraphArgs) -> anyhow::Result<()> {
 }
 
 fn run_quick(args: QuickArgs) -> anyhow::Result<()> {
-    let analysis = analyze_path(&args.input, args.language.into_analysis_language())
-        .with_context(|| format!("failed to analyze {}", args.input.display()))?;
+    let options = if args.include_tests {
+        AnalysisOptions::default()
+    } else {
+        AnalysisOptions::without_tests()
+    };
+    let analysis =
+        analyze_path_with_options(&args.input, args.language.into_analysis_language(), options)
+            .with_context(|| format!("failed to analyze {}", args.input.display()))?;
 
     let workspace = create_quick_workspace()?;
     let dot = render_dot(&analysis);

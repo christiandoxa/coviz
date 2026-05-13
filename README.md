@@ -65,6 +65,9 @@ When Graphviz `dot` is installed, quick mode renders `graph.svg` with Graphviz
 for a cleaner clustered layout. Without Graphviz, it falls back to the built-in
 browser renderer.
 
+Quick mode excludes common test files, Rust `#[cfg(test)]` code, `tests/`, and
+`target/` by default. Use `--include-tests` when you need those nodes.
+
 Use automatic language detection and stdout:
 
 ```bash
