@@ -302,9 +302,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     .chips {
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       gap: 0.35rem;
-      margin: -0.4rem 0 0.75rem;
+      margin: -0.4rem 0 0.65rem;
+      max-width: 100%;
+      overflow-x: auto;
+      padding-bottom: 0.25rem;
+      scrollbar-color: #6f7888 transparent;
+      scrollbar-width: thin;
     }
 
     .chip {
@@ -316,6 +321,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       font: inherit;
       font-size: 0.82rem;
       font-weight: 700;
+      flex: 0 0 auto;
       padding: 0.35rem 0.58rem;
     }
 
@@ -327,8 +333,8 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     #canvas {
       position: relative;
-      height: calc(100vh - 9rem);
-      min-height: 30rem;
+      flex: 1 1 auto;
+      min-height: 0;
       overflow: hidden;
       border: 1px solid #6f7888;
       background: #dde5f4;
@@ -348,6 +354,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       min-height: calc(100vh - 9rem);
       transform-origin: 0 0;
       will-change: transform;
+    }
+
+    .graph-canvas {
+      display: block;
+      height: 100%;
+      width: 100%;
+    }
+
+    .virtual-graph {
+      display: block;
+      height: 100%;
+      min-height: 100%;
+      position: relative;
+      width: 100%;
     }
 
     #canvas svg {
@@ -524,7 +544,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     .workspace {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
       min-width: 0;
+      min-height: 0;
     }
 
     .splitter {
@@ -731,8 +755,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         </div>
         <div class="toolbar-group">
           <select id="layout-preset" aria-label="Layout preset">
+            <option value="by-folder">By folder flow</option>
             <option value="all">All calls</option>
-            <option value="by-file">Group by file</option>
+            <option value="by-file">By file flow</option>
             <option value="fan-in">Fan-in only</option>
             <option value="fan-out">Fan-out only</option>
             <option value="cycles">Cycles</option>
@@ -785,12 +810,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       callsByEdge: new Map(),
       selectedNode: null,
       selectedEdge: null,
+      selectedGroup: null,
       isolate: false,
       hideIsolated: false,
       preset: "all",
       searchMatches: [],
       searchIndex: -1,
-      sourceMode: "context"
+      sourceMode: "context",
+      canvasRenderer: null
     };
     const view = {
       scale: 1,
@@ -869,7 +896,12 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         return;
       }
 
-      target.style.transform = `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`;
+      if (state.canvasRenderer) {
+        target.style.transform = "";
+        drawCanvasGraph();
+      } else {
+        target.style.transform = `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`;
+      }
       updateMinimap();
     }
 
@@ -881,6 +913,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function setGraphContent(html) {
+      state.canvasRenderer = null;
       canvas.innerHTML = `
         <div id="viewport" class="graph-viewport">${html}</div>
         <div id="minimap" class="minimap" aria-label="Graph minimap" title="Click or drag to move the viewport">
@@ -1011,7 +1044,44 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return nodeBaseVisible(caller) && nodeBaseVisible(callee);
     }
 
+    function activeGroupMode() {
+      if (state.preset === "by-folder" || state.preset === "by-file") {
+        return state.preset;
+      }
+      return null;
+    }
+
+    function groupKeyForFile(file, mode = "by-folder") {
+      const parts = String(file || "source").split("/").filter(Boolean);
+      if (!parts.length) {
+        return "source";
+      }
+      if (mode === "by-file") {
+        return file;
+      }
+      if (parts[0] === "crates" && parts.length >= 2) {
+        return `${parts[0]}/${parts[1]}`;
+      }
+      if (parts[0] === "src" && parts.length >= 2) {
+        return `${parts[0]}/${parts[1]}`;
+      }
+      return parts.slice(0, Math.min(2, parts.length)).join("/");
+    }
+
+    function groupIdForFunction(id, mode = activeGroupMode() || "by-folder") {
+      const item = state.functions.get(id);
+      return item ? groupKeyForFile(item.file, mode) : null;
+    }
+
     function graphElementBounds() {
+      if (state.canvasRenderer) {
+        const mode = activeGroupMode();
+        if (mode) {
+          return groupGraph(mode).bounds;
+        }
+        return state.canvasRenderer.bounds;
+      }
+
       const target = viewport();
       if (!target) {
         return { width: 1, height: 1 };
@@ -1046,6 +1116,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         return;
       }
 
+      if (state.canvasRenderer) {
+        minimapGraph.innerHTML = '<canvas class="graph-canvas" aria-hidden="true"></canvas>';
+        drawCanvasMinimap();
+        updateMinimap();
+        return;
+      }
+
       const svg = target.querySelector("svg");
       if (svg) {
         const clone = svg.cloneNode(true);
@@ -1072,7 +1149,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const graphHeight = graph.height * scale;
       const graphLeft = (minimap.clientWidth - graphWidth) / 2;
       const graphTop = (minimap.clientHeight - graphHeight) / 2;
-      minimapGraph.style.transform = `translate(${graphLeft}px, ${graphTop}px) scale(${scale})`;
+      minimapGraph.style.transform = state.canvasRenderer ? "" : `translate(${graphLeft}px, ${graphTop}px) scale(${scale})`;
 
       const left = graphLeft + (-view.offsetX / view.scale) * scale;
       const top = graphTop + (-view.offsetY / view.scale) * scale;
@@ -1250,9 +1327,64 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       `;
     }
 
+    function renderGroupInspector(id) {
+      const graph = groupGraph(activeGroupMode() || "by-folder");
+      const group = graph.groups.get(id);
+      if (!group) {
+        renderHome();
+        return;
+      }
+
+      const topFunctions = group.functionIds
+        .map((functionId) => {
+          const item = state.functions.get(functionId);
+          return { item, count: (state.outgoing.get(functionId) || []).length };
+        })
+        .filter(({ item }) => Boolean(item))
+        .sort((left, right) => right.count - left.count || left.item.name.localeCompare(right.item.name))
+        .slice(0, 8);
+      const outgoing = graph.edges
+        .filter((edge) => edge.caller === id)
+        .sort((left, right) => right.count - left.count)
+        .slice(0, 8);
+      const incoming = graph.edges
+        .filter((edge) => edge.callee === id)
+        .sort((left, right) => right.count - left.count)
+        .slice(0, 8);
+
+      inspector.innerHTML = `
+        <h2>${escapeHtml(group.label)}</h2>
+        <p class="muted">${group.files.size} files / ${group.functionIds.length} functions / ${group.internalCalls} internal calls</p>
+        <div class="stat-grid">
+          <div class="stat"><strong>${group.incomingCalls}</strong><span>incoming calls</span></div>
+          <div class="stat"><strong>${group.outgoingCalls}</strong><span>outgoing calls</span></div>
+        </div>
+        <h3>Outgoing groups</h3>
+        ${renderGroupEdgeList(outgoing, "callee", graph)}
+        <h3>Incoming groups</h3>
+        ${renderGroupEdgeList(incoming, "caller", graph)}
+        <h3>Highest fan-out functions</h3>
+        <ul class="call-list">
+          ${topFunctions.map(({ item, count }) => `<li data-node-id="${item.id}">${escapeHtml(item.name)} <span class="muted">${count} calls</span><br><span class="muted">${escapeHtml(item.file)}:${item.line}</span></li>`).join("")}
+        </ul>
+      `;
+    }
+
+    function renderGroupEdgeList(edges, side, graph) {
+      if (!edges.length) {
+        return '<p class="muted">None.</p>';
+      }
+
+      return `<ul class="call-list">${edges.map((edge) => {
+        const target = graph.groups.get(edge[side]);
+        return `<li data-group-id="${escapeHtml(edge[side])}">${escapeHtml(target?.label || edge[side])}<br><span class="muted">${edge.count} calls</span></li>`;
+      }).join("")}</ul>`;
+    }
+
     function selectNode(id) {
       state.selectedNode = id;
       state.selectedEdge = null;
+      state.selectedGroup = null;
       renderNodeInspector(id);
       applyGraphState();
     }
@@ -1260,7 +1392,16 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     function selectEdge(key) {
       state.selectedEdge = key;
       state.selectedNode = null;
+      state.selectedGroup = null;
       renderEdgeInspector(key);
+      applyGraphState();
+    }
+
+    function selectGroup(id) {
+      state.selectedGroup = id;
+      state.selectedNode = null;
+      state.selectedEdge = null;
+      renderGroupInspector(id);
       applyGraphState();
     }
 
@@ -1277,6 +1418,71 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       if (id && state.functions.has(id)) {
         selectNode(id);
       }
+    }
+
+    function selectFromPoint(clientX, clientY, target) {
+      if (state.canvasRenderer && target?.closest?.("#graph-canvas")) {
+        if (activeGroupMode()) {
+          const group = hitCanvasGroup(clientX, clientY);
+          if (group) {
+            selectGroup(group);
+          }
+        } else {
+          const hit = hitCanvasNode(clientX, clientY);
+          if (hit) {
+            selectNode(hit);
+          }
+        }
+        return;
+      }
+
+      selectFromElement(target);
+    }
+
+    function hitCanvasGroup(clientX, clientY) {
+      const mode = activeGroupMode();
+      if (!state.canvasRenderer || !mode) {
+        return null;
+      }
+
+      const graph = groupGraph(mode);
+      const rect = canvas.getBoundingClientRect();
+      const graphX = (clientX - rect.left - view.offsetX) / view.scale;
+      const graphY = (clientY - rect.top - view.offsetY) / view.scale;
+      for (const [id, point] of graph.positions) {
+        const group = graph.groups.get(id);
+        if (!groupVisible(group)) {
+          continue;
+        }
+        const dx = Math.abs(graphX - point.x);
+        const dy = Math.abs(graphY - point.y);
+        if (dx <= graph.nodeWidth / 2 && dy <= graph.nodeHeight / 2) {
+          return id;
+        }
+      }
+      return null;
+    }
+
+    function hitCanvasNode(clientX, clientY) {
+      const renderer = state.canvasRenderer;
+      if (!renderer) {
+        return null;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      const graphX = (clientX - rect.left - view.offsetX) / view.scale;
+      const graphY = (clientY - rect.top - view.offsetY) / view.scale;
+      for (const [id, point] of renderer.positions) {
+        if (!nodeBaseVisible(id)) {
+          continue;
+        }
+        const dx = Math.abs(graphX - point.x);
+        const dy = Math.abs(graphY - point.y);
+        if (dx <= renderer.nodeWidth / 2 && dy <= renderer.nodeHeight / 2) {
+          return id;
+        }
+      }
+      return null;
     }
 
     function neighborhood() {
@@ -1316,6 +1522,21 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function centerNode(id) {
+      if (state.canvasRenderer) {
+        const mode = activeGroupMode();
+        const groupId = mode ? groupIdForFunction(id, mode) : null;
+        const point = groupId
+          ? groupGraph(mode).positions.get(groupId)
+          : state.canvasRenderer.positions.get(id);
+        if (!point) {
+          return;
+        }
+        view.offsetX = canvas.clientWidth / 2 - point.x * view.scale;
+        view.offsetY = canvas.clientHeight / 2 - point.y * view.scale;
+        applyViewTransform();
+        return;
+      }
+
       const node = [...document.querySelectorAll("#canvas .node")].find((element) => {
         const nodeId = element.dataset.id || element.querySelector?.("title")?.textContent;
         return nodeId === id;
@@ -1330,6 +1551,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const nodeY = nodeRect.top - canvasRect.top + nodeRect.height / 2;
       view.offsetX += canvas.clientWidth / 2 - nodeX;
       view.offsetY += canvas.clientHeight / 2 - nodeY;
+      applyViewTransform();
+    }
+
+    function centerGroup(id) {
+      const mode = activeGroupMode();
+      if (!state.canvasRenderer || !mode) {
+        return;
+      }
+      const point = groupGraph(mode).positions.get(id);
+      if (!point) {
+        return;
+      }
+      view.offsetX = canvas.clientWidth / 2 - point.x * view.scale;
+      view.offsetY = canvas.clientHeight / 2 - point.y * view.scale;
       applyViewTransform();
     }
 
@@ -1349,6 +1584,17 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     function applyGraphState() {
       const query = filter.value.trim().toLowerCase();
       updateSearchMatches(query);
+      if (state.canvasRenderer) {
+        isolateButton.classList.toggle("active", state.isolate);
+        hideIsolatedButton.classList.toggle("active", state.hideIsolated);
+        layoutPreset.value = state.preset;
+        renderFileFilters();
+        drawCanvasGraph();
+        drawCanvasMinimap();
+        updateMinimap();
+        return;
+      }
+
       const isolated = neighborhood();
 
       document.querySelectorAll("#canvas .node").forEach((node) => {
@@ -1459,7 +1705,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         canvas.releasePointerCapture(event.pointerId);
       }
       if (!view.moved) {
-        selectFromElement(view.startTarget);
+        selectFromPoint(event.clientX, event.clientY, view.startTarget);
       }
     }
 
@@ -1526,6 +1772,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     });
     layoutPreset.addEventListener("change", () => {
       state.preset = layoutPreset.value;
+      state.selectedGroup = null;
       applyGraphState();
     });
     fileFilters.addEventListener("click", (event) => {
@@ -1563,6 +1810,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       if (copy) {
         navigator.clipboard?.writeText(copy.dataset.copyText);
         copy.textContent = "Copied";
+        return;
+      }
+
+      const group = event.target.closest("[data-group-id]");
+      if (group) {
+        selectGroup(group.dataset.groupId);
+        centerGroup(group.dataset.groupId);
         return;
       }
 
@@ -1658,12 +1912,488 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         });
     }
 
+    function shouldUseCanvasRenderer(data) {
+      return data.functions.length > 1200 || data.calls.length > 3000;
+    }
+
+    function fallbackDrawCanvas(data) {
+      const layout = canvasLayout(data.functions);
+      if (state.preset === "all" && shouldUseCanvasRenderer(data)) {
+        state.preset = "by-folder";
+      }
+      state.canvasRenderer = {
+        canvas: null,
+        positions: layout.positions,
+        bounds: layout.bounds,
+        nodeWidth: 170,
+        nodeHeight: 48,
+        edgeBudget: data.calls.length > 12000 ? 9000 : 14000,
+        groupCache: new Map()
+      };
+
+      canvas.innerHTML = `
+        <div id="viewport" class="graph-viewport virtual-graph">
+          <canvas id="graph-canvas" class="graph-canvas" aria-label="Virtualized call graph canvas"></canvas>
+        </div>
+        <div id="minimap" class="minimap" aria-label="Graph minimap" title="Click or drag to move the viewport">
+          <div id="minimap-graph" class="minimap-graph"></div>
+          <div id="minimap-window" class="minimap-window"></div>
+        </div>
+      `;
+      state.canvasRenderer.canvas = document.querySelector("#graph-canvas");
+      view.scale = 1;
+      view.offsetX = 24;
+      view.offsetY = 24;
+      drawCanvasGraph();
+      renderMinimap();
+      applyGraphState();
+    }
+
+    function canvasLayout(nodes) {
+      const sorted = [...nodes].sort((left, right) =>
+        left.file.localeCompare(right.file)
+        || left.name.localeCompare(right.name)
+        || left.line - right.line
+      );
+      const columns = Math.max(8, Math.ceil(Math.sqrt(sorted.length * 1.8)));
+      const cellWidth = 210;
+      const cellHeight = 78;
+      const positions = new Map();
+
+      sorted.forEach((node, index) => {
+        positions.set(node.id, {
+          x: 90 + (index % columns) * cellWidth,
+          y: 70 + Math.floor(index / columns) * cellHeight
+        });
+      });
+
+      return {
+        positions,
+        bounds: {
+          width: columns * cellWidth + 180,
+          height: Math.ceil(sorted.length / columns) * cellHeight + 140
+        }
+      };
+    }
+
+    function resizeCanvasForDisplay(canvasElement) {
+      const width = Math.max(1, canvas.clientWidth);
+      const height = Math.max(1, canvas.clientHeight);
+      const ratio = window.devicePixelRatio || 1;
+      const pixelWidth = Math.floor(width * ratio);
+      const pixelHeight = Math.floor(height * ratio);
+      if (canvasElement.width !== pixelWidth || canvasElement.height !== pixelHeight) {
+        canvasElement.width = pixelWidth;
+        canvasElement.height = pixelHeight;
+      }
+      canvasElement.style.width = `${width}px`;
+      canvasElement.style.height = `${height}px`;
+      const context = canvasElement.getContext("2d");
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return { context, width, height };
+    }
+
+    function visibleCanvasPoint(point, width, height, padding = 180) {
+      const x = point.x * view.scale + view.offsetX;
+      const y = point.y * view.scale + view.offsetY;
+      return x >= -padding && x <= width + padding && y >= -padding && y <= height + padding;
+    }
+
+    function canvasCallColor(kind) {
+      if (kind === "method") {
+        return "#1d6f8f";
+      }
+      if (kind === "associated") {
+        return "#6d4aa1";
+      }
+      if (kind === "unknown") {
+        return "#6f7888";
+      }
+      return "#934f12";
+    }
+
+    function fileColor(file) {
+      const colors = ["#ffffdd", "#d9f7d8", "#d8ecff", "#eadcff", "#ffe5c7"];
+      let hash = 0;
+      for (const char of String(file)) {
+        hash = (hash + char.charCodeAt(0)) % colors.length;
+      }
+      return colors[hash];
+    }
+
+    function groupGraph(mode) {
+      const renderer = state.canvasRenderer;
+      const cached = renderer?.groupCache?.get(mode);
+      if (cached) {
+        return cached;
+      }
+
+      const groups = new Map();
+      for (const item of state.functions.values()) {
+        const id = groupKeyForFile(item.file, mode);
+        if (!groups.has(id)) {
+          groups.set(id, {
+            id,
+            label: id,
+            top: id.split("/")[0] || id,
+            files: new Set(),
+            functionIds: [],
+            incomingCalls: 0,
+            outgoingCalls: 0,
+            internalCalls: 0
+          });
+        }
+        const group = groups.get(id);
+        group.files.add(item.file);
+        group.functionIds.push(item.id);
+      }
+
+      const edgeMap = new Map();
+      for (const call of state.graph.calls) {
+        const caller = groupIdForFunction(call.caller, mode);
+        const callee = groupIdForFunction(call.callee, mode);
+        if (!caller || !callee) {
+          continue;
+        }
+        if (caller === callee) {
+          groups.get(caller).internalCalls += 1;
+          continue;
+        }
+        const key = `${caller}->${callee}`;
+        if (!edgeMap.has(key)) {
+          edgeMap.set(key, {
+            caller,
+            callee,
+            count: 0,
+            kind: callKind(call)
+          });
+        }
+        const edge = edgeMap.get(key);
+        edge.count += 1;
+        groups.get(caller).outgoingCalls += 1;
+        groups.get(callee).incomingCalls += 1;
+      }
+
+      const groupList = [...groups.values()];
+      const positions = groupLayout(groupList);
+      const graph = {
+        groups,
+        edges: [...edgeMap.values()],
+        positions,
+        nodeWidth: mode === "by-file" ? 250 : 285,
+        nodeHeight: mode === "by-file" ? 78 : 88,
+        bounds: groupBounds(positions)
+      };
+      renderer?.groupCache?.set(mode, graph);
+      return graph;
+    }
+
+    function groupLayout(groups) {
+      const topBuckets = new Map();
+      for (const group of groups) {
+        if (!topBuckets.has(group.top)) {
+          topBuckets.set(group.top, []);
+        }
+        topBuckets.get(group.top).push(group);
+      }
+
+      const topEntries = [...topBuckets.entries()]
+        .sort((left, right) => right[1].length - left[1].length || left[0].localeCompare(right[0]));
+      const positions = new Map();
+      const columnWidth = 340;
+      const rowHeight = 120;
+      topEntries.forEach(([_, bucket], column) => {
+        bucket
+          .sort((left, right) =>
+            (right.outgoingCalls + right.incomingCalls + right.internalCalls)
+            - (left.outgoingCalls + left.incomingCalls + left.internalCalls)
+            || left.label.localeCompare(right.label)
+          )
+          .forEach((group, row) => {
+            positions.set(group.id, {
+              x: 170 + column * columnWidth,
+              y: 95 + row * rowHeight
+            });
+          });
+      });
+      return positions;
+    }
+
+    function groupBounds(positions) {
+      let width = 980;
+      let height = 680;
+      for (const point of positions.values()) {
+        width = Math.max(width, point.x + 220);
+        height = Math.max(height, point.y + 150);
+      }
+      return { width, height };
+    }
+
+    function groupVisible(group) {
+      return group?.functionIds?.some((id) => nodeBaseVisible(id));
+    }
+
+    function groupMatchesQuery(group, query) {
+      if (!query) {
+        return true;
+      }
+      if (group.label.toLowerCase().includes(query)) {
+        return true;
+      }
+      return group.functionIds.some((id) => nodeMatchesQuery(id, query));
+    }
+
+    function drawCanvasGraph() {
+      const renderer = state.canvasRenderer;
+      if (!renderer?.canvas) {
+        return;
+      }
+
+      const { context, width, height } = resizeCanvasForDisplay(renderer.canvas);
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = "#dde5f4";
+      context.fillRect(0, 0, width, height);
+
+      const groupMode = activeGroupMode();
+      if (groupMode) {
+        drawCanvasGroupGraph(context, width, height, groupGraph(groupMode));
+        return;
+      }
+
+      const query = filter.value.trim().toLowerCase();
+      const isolated = neighborhood();
+      let drawnEdges = 0;
+      context.lineCap = "round";
+
+      for (const call of state.graph.calls) {
+        if (drawnEdges >= renderer.edgeBudget && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+          continue;
+        }
+
+        const caller = renderer.positions.get(call.caller);
+        const callee = renderer.positions.get(call.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        if (!visibleCanvasPoint(caller, width, height) && !visibleCanvasPoint(callee, width, height)) {
+          continue;
+        }
+        if (!edgeBaseVisible(call, call.caller, call.callee)) {
+          continue;
+        }
+
+        const dim = !edgePassesPreset(call, call.caller, call.callee)
+          || !edgeMatchesQuery(call, call.caller, call.callee, query)
+          || (isolated && !(isolated.has(call.caller) && isolated.has(call.callee)));
+        if (dim && view.scale < 0.45 && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+          continue;
+        }
+
+        context.globalAlpha = dim ? 0.12 : 0.42;
+        context.strokeStyle = canvasCallColor(callKind(call));
+        context.lineWidth = Math.max(0.65, view.scale * 1.2);
+        context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
+        context.beginPath();
+        context.moveTo(caller.x * view.scale + view.offsetX, caller.y * view.scale + view.offsetY);
+        context.lineTo(callee.x * view.scale + view.offsetX, callee.y * view.scale + view.offsetY);
+        context.stroke();
+        drawnEdges += 1;
+      }
+      context.setLineDash([]);
+
+      for (const [id, point] of renderer.positions) {
+        if (!visibleCanvasPoint(point, width, height)) {
+          continue;
+        }
+        if (!nodeBaseVisible(id)) {
+          continue;
+        }
+
+        const item = state.functions.get(id);
+        const dim = !passesPreset(id)
+          || !nodeMatchesQuery(id, query)
+          || (isolated && !isolated.has(id));
+        const x = point.x * view.scale + view.offsetX;
+        const y = point.y * view.scale + view.offsetY;
+        const nodeWidth = renderer.nodeWidth * view.scale;
+        const nodeHeight = renderer.nodeHeight * view.scale;
+
+        context.globalAlpha = dim ? 0.16 : 1;
+        context.fillStyle = fileColor(item?.file || "");
+        context.strokeStyle = id === state.selectedNode ? "#d12f1f" : "#111111";
+        context.lineWidth = id === state.selectedNode ? Math.max(2, view.scale * 3) : Math.max(1, view.scale * 1.4);
+        context.beginPath();
+        context.ellipse(x, y, nodeWidth / 2, nodeHeight / 2, 0, 0, Math.PI * 2);
+        context.fill();
+        context.stroke();
+
+        if (view.scale >= 0.55 && item) {
+          context.globalAlpha = dim ? 0.28 : 1;
+          context.fillStyle = "#10131a";
+          context.font = `${Math.max(9, 12 * view.scale)}px Helvetica, Arial, sans-serif`;
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          const label = item.name.length > 24 ? `${item.name.slice(0, 23)}...` : item.name;
+          context.fillText(label, x, y - (view.scale >= 0.8 ? 7 * view.scale : 0), nodeWidth - 12);
+          if (view.scale >= 0.8) {
+            context.fillStyle = "#536070";
+            context.font = `${Math.max(8, 10 * view.scale)}px Helvetica, Arial, sans-serif`;
+            context.fillText(fileLabel(item.file), x, y + 10 * view.scale, nodeWidth - 12);
+          }
+        }
+      }
+
+      context.globalAlpha = 1;
+    }
+
+    function drawCanvasGroupGraph(context, width, height, graph) {
+      const query = filter.value.trim().toLowerCase();
+      const visibleGroups = new Set([...graph.groups.values()].filter(groupVisible).map((group) => group.id));
+
+      context.lineCap = "round";
+      for (const edge of graph.edges) {
+        if (!visibleGroups.has(edge.caller) || !visibleGroups.has(edge.callee)) {
+          continue;
+        }
+        const caller = graph.positions.get(edge.caller);
+        const callee = graph.positions.get(edge.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        if (!visibleCanvasPoint(caller, width, height, 260) && !visibleCanvasPoint(callee, width, height, 260)) {
+          continue;
+        }
+        const callerGroup = graph.groups.get(edge.caller);
+        const calleeGroup = graph.groups.get(edge.callee);
+        const dim = !groupMatchesQuery(callerGroup, query) && !groupMatchesQuery(calleeGroup, query);
+        context.globalAlpha = dim ? 0.1 : 0.5;
+        context.strokeStyle = canvasCallColor(edge.kind);
+        context.lineWidth = Math.min(8, Math.max(1, Math.log2(edge.count + 1))) * Math.max(0.75, view.scale);
+        context.beginPath();
+        context.moveTo(caller.x * view.scale + view.offsetX, caller.y * view.scale + view.offsetY);
+        const midX = (caller.x + callee.x) / 2 * view.scale + view.offsetX;
+        context.bezierCurveTo(
+          midX,
+          caller.y * view.scale + view.offsetY,
+          midX,
+          callee.y * view.scale + view.offsetY,
+          callee.x * view.scale + view.offsetX,
+          callee.y * view.scale + view.offsetY
+        );
+        context.stroke();
+
+        if (view.scale >= 0.5 && !dim) {
+          context.globalAlpha = 0.86;
+          context.fillStyle = "#10131a";
+          context.font = `${Math.max(9, 11 * view.scale)}px Helvetica, Arial, sans-serif`;
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.fillText(String(edge.count), midX, ((caller.y + callee.y) / 2) * view.scale + view.offsetY - 6);
+        }
+      }
+
+      for (const [id, point] of graph.positions) {
+        const group = graph.groups.get(id);
+        if (!groupVisible(group) || !visibleCanvasPoint(point, width, height, 260)) {
+          continue;
+        }
+        const dim = !groupMatchesQuery(group, query);
+        const selected = state.selectedGroup === id || (state.selectedNode && group.functionIds.includes(state.selectedNode));
+        const x = point.x * view.scale + view.offsetX;
+        const y = point.y * view.scale + view.offsetY;
+        const nodeWidth = graph.nodeWidth * view.scale;
+        const nodeHeight = graph.nodeHeight * view.scale;
+        const radius = 14 * view.scale;
+
+        context.globalAlpha = dim ? 0.18 : 1;
+        context.fillStyle = fileColor(id);
+        context.strokeStyle = selected ? "#d12f1f" : "#111111";
+        context.lineWidth = selected ? Math.max(2, 3 * view.scale) : Math.max(1, 1.5 * view.scale);
+        roundedRect(context, x - nodeWidth / 2, y - nodeHeight / 2, nodeWidth, nodeHeight, radius);
+        context.fill();
+        context.stroke();
+
+        if (view.scale >= 0.32) {
+          context.globalAlpha = dim ? 0.32 : 1;
+          context.fillStyle = "#10131a";
+          context.font = `700 ${Math.max(10, 15 * view.scale)}px Helvetica, Arial, sans-serif`;
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          const label = group.label.length > 34 ? `${group.label.slice(0, 33)}...` : group.label;
+          context.fillText(label, x, y - 10 * view.scale, nodeWidth - 18);
+          if (view.scale >= 0.48) {
+            context.fillStyle = "#536070";
+            context.font = `${Math.max(8, 11 * view.scale)}px Helvetica, Arial, sans-serif`;
+            context.fillText(`${group.functionIds.length} funcs / ${group.files.size} files`, x, y + 10 * view.scale, nodeWidth - 18);
+          }
+        }
+      }
+
+      context.globalAlpha = 1;
+    }
+
+    function roundedRect(context, x, y, width, height, radius) {
+      const nextRadius = Math.min(radius, width / 2, height / 2);
+      context.beginPath();
+      context.moveTo(x + nextRadius, y);
+      context.lineTo(x + width - nextRadius, y);
+      context.quadraticCurveTo(x + width, y, x + width, y + nextRadius);
+      context.lineTo(x + width, y + height - nextRadius);
+      context.quadraticCurveTo(x + width, y + height, x + width - nextRadius, y + height);
+      context.lineTo(x + nextRadius, y + height);
+      context.quadraticCurveTo(x, y + height, x, y + height - nextRadius);
+      context.lineTo(x, y + nextRadius);
+      context.quadraticCurveTo(x, y, x + nextRadius, y);
+      context.closePath();
+    }
+
+    function drawCanvasMinimap() {
+      const renderer = state.canvasRenderer;
+      const minimap = document.querySelector("#minimap");
+      const canvasElement = document.querySelector("#minimap-graph canvas");
+      if (!renderer || !minimap || !canvasElement) {
+        return;
+      }
+
+      const ratio = window.devicePixelRatio || 1;
+      const width = Math.max(1, minimap.clientWidth);
+      const height = Math.max(1, minimap.clientHeight);
+      canvasElement.width = Math.floor(width * ratio);
+      canvasElement.height = Math.floor(height * ratio);
+      canvasElement.style.width = `${width}px`;
+      canvasElement.style.height = `${height}px`;
+      const context = canvasElement.getContext("2d");
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const graph = activeGroupMode() ? groupGraph(activeGroupMode()) : renderer;
+      const scale = Math.min(width / graph.bounds.width, height / graph.bounds.height);
+      const left = (width - graph.bounds.width * scale) / 2;
+      const top = (height - graph.bounds.height * scale) / 2;
+      context.fillStyle = "rgba(29, 111, 143, 0.32)";
+      for (const [id, point] of graph.positions) {
+        if (activeGroupMode()) {
+          if (!groupVisible(graph.groups.get(id))) {
+            continue;
+          }
+        } else if (!nodeBaseVisible(id)) {
+          continue;
+        }
+        context.fillRect(left + point.x * scale, top + point.y * scale, activeGroupMode() ? 3 : 1.5, activeGroupMode() ? 3 : 1.5);
+      }
+    }
+
     function fallbackDraw(data) {
       const nodes = data.functions;
       const calls = data.calls;
 
       if (!nodes.length) {
         canvas.innerHTML = '<div class="empty">No supported functions found.</div>';
+        return;
+      }
+
+      if (shouldUseCanvasRenderer(data)) {
+        fallbackDrawCanvas(data);
         return;
       }
 
