@@ -61,6 +61,10 @@ Open a quick local browser viewer. The command writes temporary files under
 coviz quick ./src --language rust
 ```
 
+When Graphviz `dot` is installed, quick mode renders `graph.svg` with Graphviz
+for a cleaner clustered layout. Without Graphviz, it falls back to the built-in
+browser renderer.
+
 Use automatic language detection and stdout:
 
 ```bash

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 
 use crate::model::{Analysis, Call, Function};
@@ -5,7 +7,13 @@ use crate::model::{Analysis, Call, Function};
 /// Render an analysis graph in Graphviz DOT format.
 pub fn render_dot(analysis: &Analysis) -> String {
     let mut functions = analysis.functions.clone();
-    functions.sort_by(|left, right| left.id.cmp(&right.id));
+    functions.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then(left.name.cmp(&right.name))
+            .then(left.line.cmp(&right.line))
+            .then(left.id.cmp(&right.id))
+    });
 
     let mut calls = analysis.calls.clone();
     calls.sort_by(|left, right| {
@@ -16,13 +24,35 @@ pub fn render_dot(analysis: &Analysis) -> String {
             .then(left.line.cmp(&right.line))
     });
 
-    let mut output = String::from("digraph coviz {\n  rankdir=LR;\n");
+    let mut functions_by_file: BTreeMap<&str, Vec<&Function>> = BTreeMap::new();
     for function in &functions {
+        functions_by_file
+            .entry(function.file.as_str())
+            .or_default()
+            .push(function);
+    }
+
+    let mut output = String::from(
+        "digraph coviz {\n  graph [rankdir=LR, bgcolor=\"#dde5f4\", pad=\"0.35\", nodesep=\"0.6\", ranksep=\"1.0\", splines=true, overlap=false, fontname=\"Helvetica\"];\n  node [shape=ellipse, style=\"filled\", fillcolor=\"#b9e1ea\", color=\"#111111\", penwidth=1.6, fontname=\"Helvetica\", fontsize=14, margin=\"0.12,0.08\"];\n  edge [color=\"#934f12\", arrowsize=0.75, penwidth=1.2, fontname=\"Helvetica\", fontsize=10];\n",
+    );
+
+    for (file, file_functions) in functions_by_file {
         output.push_str(&format!(
-            "  \"{}\" [label=\"{}\"];\n",
-            escape_dot(&function.id),
-            escape_dot(&function_label(function)),
+            "  subgraph \"cluster_{}\" {{\n    graph [label=\"{}\", style=\"filled\", fillcolor=\"{}\", color=\"#333333\", penwidth=1.1, fontname=\"Helvetica-Bold\", fontsize=18, margin=14];\n",
+            escape_dot(&cluster_id(file)),
+            escape_dot(&cluster_label(file)),
+            cluster_color(file),
         ));
+
+        for function in file_functions {
+            output.push_str(&format!(
+                "    \"{}\" [label=\"{}\"];\n",
+                escape_dot(&function.id),
+                escape_dot(&function_label(function)),
+            ));
+        }
+
+        output.push_str("  }\n");
     }
 
     for call in &calls {
@@ -58,6 +88,43 @@ fn call_label(call: &Call) -> String {
     format!("{}:{}", call.file, call.line)
 }
 
+fn cluster_label(file: &str) -> String {
+    let trimmed = file.trim_matches('/');
+    if trimmed.is_empty() {
+        return "source".to_string();
+    }
+
+    let mut parts = trimmed.rsplit('/');
+    let file_name = parts.next().unwrap_or(trimmed);
+    let parent = parts.next();
+
+    match parent {
+        Some(parent) => format!("{parent}/{file_name}"),
+        None => file_name.to_string(),
+    }
+}
+
+fn cluster_color(file: &str) -> &'static str {
+    let colors = ["#ffffdd", "#d9f7d8", "#d8ecff", "#eadcff", "#ffe5c7"];
+    let hash = file
+        .bytes()
+        .fold(0_usize, |state, byte| state.wrapping_add(byte as usize));
+    colors[hash % colors.len()]
+}
+
+fn cluster_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn escape_dot(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -73,13 +140,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
   <title>coviz quick</title>
   <style>
     :root {
-      --bg: #f5f1e8;
-      --ink: #1c1b17;
-      --muted: #676056;
-      --panel: #fffaf0;
-      --line: #d6c7ad;
-      --accent: #0f766e;
-      --edge: #9a6a2f;
+      --bg: #d8deeb;
+      --ink: #10131a;
+      --muted: #536070;
+      --panel: #eef3ff;
+      --panel-strong: #fff8d4;
+      --line: #8b95a7;
+      --accent: #934f12;
     }
 
     * {
@@ -90,36 +157,34 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       margin: 0;
       min-height: 100vh;
       color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(15, 118, 110, 0.18), transparent 34rem),
-        linear-gradient(135deg, #fbf4df 0%, var(--bg) 45%, #e8dcc8 100%);
-      font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+      background: var(--bg);
+      font-family: Helvetica, Arial, sans-serif;
     }
 
     header {
-      padding: 2rem clamp(1rem, 4vw, 4rem) 1rem;
       display: flex;
-      align-items: end;
+      align-items: center;
       justify-content: space-between;
       gap: 1rem;
+      padding: 0.9rem 1.25rem;
       border-bottom: 1px solid var(--line);
+      background: #cfd8e8;
     }
 
     h1 {
       margin: 0;
-      font-size: clamp(2.5rem, 7vw, 6rem);
-      letter-spacing: -0.08em;
-      line-height: 0.9;
+      font-size: 1.45rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
     }
 
     .summary {
       color: var(--muted);
-      font-size: 1rem;
-      text-align: right;
+      font-size: 0.95rem;
     }
 
     main {
-      padding: 1rem clamp(1rem, 4vw, 4rem) 3rem;
+      padding: 1rem;
     }
 
     .toolbar {
@@ -127,56 +192,69 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       flex-wrap: wrap;
       gap: 0.75rem;
       align-items: center;
-      margin: 1rem 0;
+      margin-bottom: 1rem;
     }
 
     input {
-      width: min(32rem, 100%);
+      width: min(34rem, 100%);
       border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(255, 250, 240, 0.78);
+      border-radius: 0.35rem;
+      background: white;
       color: var(--ink);
-      padding: 0.8rem 1rem;
+      padding: 0.65rem 0.8rem;
       font: inherit;
     }
 
     a {
       color: var(--accent);
       font-weight: 700;
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
     }
 
     #canvas {
-      position: relative;
-      min-height: 42rem;
+      min-height: calc(100vh - 8rem);
       overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 1.25rem;
-      background: rgba(255, 250, 240, 0.6);
-      box-shadow: 0 1.5rem 5rem rgba(28, 27, 23, 0.08);
+      border: 1px solid #6f7888;
+      background: #dde5f4;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
     }
 
-    svg {
+    #canvas svg {
+      display: block;
+      width: max-content;
+      min-width: 100%;
+      height: auto;
+      min-height: calc(100vh - 8rem);
+    }
+
+    .fallback {
+      position: relative;
+      min-width: 980px;
+      min-height: 680px;
+    }
+
+    .fallback svg {
       position: absolute;
       inset: 0;
-      min-width: 100%;
-      min-height: 100%;
       pointer-events: none;
     }
 
     .node {
       position: absolute;
-      width: 12rem;
-      min-height: 5rem;
-      padding: 0.9rem;
-      border: 1px solid var(--line);
-      border-radius: 1rem;
-      background: var(--panel);
-      box-shadow: 0 1rem 2.4rem rgba(28, 27, 23, 0.12);
-      transition: opacity 120ms ease, transform 120ms ease;
-    }
-
-    .node:hover {
-      transform: translateY(-0.2rem);
+      width: 10.8rem;
+      min-height: 3.8rem;
+      display: grid;
+      place-items: center;
+      padding: 0.6rem;
+      border: 2px solid #111;
+      border-radius: 999px;
+      background: #b9e1ea;
+      text-align: center;
+      transition: opacity 120ms ease;
     }
 
     .node.hidden {
@@ -184,14 +262,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     .name {
-      font: 700 1rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight: 700;
       overflow-wrap: anywhere;
     }
 
     .meta {
-      margin-top: 0.5rem;
       color: var(--muted);
-      font-size: 0.85rem;
+      font-size: 0.76rem;
       overflow-wrap: anywhere;
     }
 
@@ -205,27 +282,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         align-items: start;
         flex-direction: column;
       }
-
-      .summary {
-        text-align: left;
-      }
-
-      #canvas {
-        min-height: 32rem;
-      }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>coviz</h1>
+    <h1>coviz quick</h1>
     <div class="summary">__FUNCTION_COUNT__ functions / __CALL_COUNT__ calls</div>
   </header>
   <main>
     <div class="toolbar">
-      <input id="filter" type="search" placeholder="Filter by function or file" autocomplete="off">
-      <a href="/graph.json">graph.json</a>
+      <input id="filter" type="search" placeholder="Filter function or file" autocomplete="off">
+      <a href="/graph.svg">graph.svg</a>
       <a href="/graph.dot">graph.dot</a>
+      <a href="/graph.json">graph.json</a>
     </div>
     <section id="canvas" aria-label="Call graph">
       <div class="empty">Loading graph...</div>
@@ -245,7 +315,34 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }[char]));
     }
 
-    function draw(data) {
+    function applySvgFilter() {
+      const query = filter.value.trim().toLowerCase();
+      const nodes = canvas.querySelectorAll(".node");
+      if (!nodes.length) {
+        return;
+      }
+
+      nodes.forEach((node) => {
+        const label = node.textContent.toLowerCase();
+        node.style.opacity = query && !label.includes(query) ? "0.12" : "1";
+      });
+    }
+
+    function renderSvg() {
+      return fetch("/graph.svg")
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error("graph.svg is unavailable");
+          }
+          return response.text();
+        })
+        .then((svg) => {
+          canvas.innerHTML = svg;
+          filter.addEventListener("input", applySvgFilter);
+        });
+    }
+
+    function fallbackDraw(data) {
       const nodes = data.functions;
       const calls = data.calls;
 
@@ -254,43 +351,57 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         return;
       }
 
-      const width = Math.max(960, nodes.length * 180);
-      const height = Math.max(620, Math.ceil(nodes.length / 8) * 520);
-      const centerX = width / 2;
-      const centerY = height / 2;
-      const radiusX = Math.max(260, width * 0.34);
-      const radiusY = Math.max(190, height * 0.28);
+      const incoming = new Map(nodes.map((node) => [node.id, 0]));
+      const outgoing = new Map(nodes.map((node) => [node.id, []]));
+      calls.forEach((call) => {
+        incoming.set(call.callee, (incoming.get(call.callee) || 0) + 1);
+        outgoing.get(call.caller)?.push(call.callee);
+      });
+
+      const depth = new Map();
+      const queue = nodes.filter((node) => (incoming.get(node.id) || 0) === 0).map((node) => node.id);
+      nodes.forEach((node) => depth.set(node.id, 0));
+
+      for (const id of queue) {
+        const nextDepth = (depth.get(id) || 0) + 1;
+        (outgoing.get(id) || []).forEach((callee) => {
+          if (nextDepth > (depth.get(callee) || 0)) {
+            depth.set(callee, nextDepth);
+            queue.push(callee);
+          }
+        });
+      }
+
+      const layers = new Map();
+      nodes.forEach((node) => {
+        const layer = depth.get(node.id) || 0;
+        if (!layers.has(layer)) {
+          layers.set(layer, []);
+        }
+        layers.get(layer).push(node);
+      });
+
+      const layerEntries = [...layers.entries()].sort((left, right) => left[0] - right[0]);
+      const width = Math.max(980, layerEntries.length * 260 + 160);
+      const height = Math.max(680, Math.max(...layerEntries.map(([, layer]) => layer.length)) * 120 + 160);
       const positions = new Map();
 
-      canvas.style.minWidth = `${width}px`;
-      canvas.style.minHeight = `${height}px`;
-      canvas.innerHTML = `
-        <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Call graph edges">
-          <defs>
-            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-              <path d="M0,0 L0,6 L9,3 z" fill="var(--edge)"></path>
-            </marker>
-          </defs>
-          <g id="edges"></g>
-        </svg>
-      `;
+      canvas.innerHTML = `<div class="fallback" style="width:${width}px;min-height:${height}px"><svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"><defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#934f12"></path></marker></defs><g id="edges"></g></svg></div>`;
+      const fallback = canvas.querySelector(".fallback");
 
-      nodes.forEach((node, index) => {
-        const angle = (-Math.PI / 2) + (Math.PI * 2 * index / nodes.length);
-        const x = centerX + Math.cos(angle) * radiusX;
-        const y = centerY + Math.sin(angle) * radiusY;
-        positions.set(node.id, { x, y, node });
-
-        const element = document.createElement("article");
-        element.className = "node";
-        element.dataset.search = `${node.name} ${node.file}`.toLowerCase();
-        element.style.left = `${x - 96}px`;
-        element.style.top = `${y - 40}px`;
-        element.innerHTML = `
-          <div class="name">${escapeHtml(node.name)}</div>
-          <div class="meta">${escapeHtml(node.file)}:${node.line}</div>
-        `;
-        canvas.appendChild(element);
+      layerEntries.forEach(([layerIndex, layer]) => {
+        const x = 90 + layerIndex * 260;
+        layer.forEach((node, row) => {
+          const y = 70 + row * 120;
+          positions.set(node.id, { x: x + 86, y: y + 34, node });
+          const element = document.createElement("article");
+          element.className = "node";
+          element.dataset.search = `${node.name} ${node.file}`.toLowerCase();
+          element.style.left = `${x}px`;
+          element.style.top = `${y}px`;
+          element.innerHTML = `<div><div class="name">${escapeHtml(node.name)}</div><div class="meta">${escapeHtml(node.file)}:${node.line}</div></div>`;
+          fallback.appendChild(element);
+        });
       });
 
       const edgeLayer = canvas.querySelector("#edges");
@@ -306,27 +417,28 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         line.setAttribute("y1", caller.y);
         line.setAttribute("x2", callee.x);
         line.setAttribute("y2", callee.y);
-        line.setAttribute("stroke", "var(--edge)");
-        line.setAttribute("stroke-width", "2");
-        line.setAttribute("stroke-opacity", "0.72");
+        line.setAttribute("stroke", "#934f12");
+        line.setAttribute("stroke-width", "1.4");
         line.setAttribute("marker-end", "url(#arrow)");
         edgeLayer.appendChild(line);
       });
+
+      filter.addEventListener("input", () => {
+        const query = filter.value.trim().toLowerCase();
+        document.querySelectorAll(".node").forEach((node) => {
+          node.classList.toggle("hidden", query && !node.dataset.search.includes(query));
+        });
+      });
     }
 
-    filter.addEventListener("input", () => {
-      const query = filter.value.trim().toLowerCase();
-      document.querySelectorAll(".node").forEach((node) => {
-        node.classList.toggle("hidden", query && !node.dataset.search.includes(query));
-      });
+    renderSvg().catch(() => {
+      fetch("/graph.json")
+        .then((response) => response.json())
+        .then(fallbackDraw)
+        .catch((error) => {
+          canvas.innerHTML = `<div class="empty">Failed to load graph: ${escapeHtml(error.message)}</div>`;
+        });
     });
-
-    fetch("/graph.json")
-      .then((response) => response.json())
-      .then(draw)
-      .catch((error) => {
-        canvas.innerHTML = `<div class="empty">Failed to load graph: ${escapeHtml(error.message)}</div>`;
-      });
   </script>
 </body>
 </html>
@@ -350,6 +462,7 @@ mod tests {
         };
 
         let dot = render_dot(&analysis);
+        assert!(dot.contains("subgraph \"cluster_main_go\""));
         assert!(dot.contains("\"f0\" [label=\"main\\nmain.go:1\"]"));
     }
 
@@ -365,6 +478,6 @@ mod tests {
         let html = render_html(&Analysis::default());
         assert!(html.contains("<title>coviz quick</title>"));
         assert!(html.contains("0 functions / 0 calls"));
-        assert!(html.contains("graph.json"));
+        assert!(html.contains("graph.svg"));
     }
 }

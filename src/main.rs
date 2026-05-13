@@ -127,12 +127,16 @@ fn run_quick(args: QuickArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to analyze {}", args.input.display()))?;
 
     let workspace = create_quick_workspace()?;
+    let dot = render_dot(&analysis);
     fs::write(workspace.join("index.html"), render_html(&analysis))
         .with_context(|| format!("failed to write quick viewer in {}", workspace.display()))?;
     fs::write(workspace.join("graph.json"), render_json(&analysis)?)
         .with_context(|| format!("failed to write graph.json in {}", workspace.display()))?;
-    fs::write(workspace.join("graph.dot"), render_dot(&analysis))
+    fs::write(workspace.join("graph.dot"), &dot)
         .with_context(|| format!("failed to write graph.dot in {}", workspace.display()))?;
+    if let Err(error) = render_quick_svg(&workspace) {
+        eprintln!("failed to render Graphviz SVG, using browser fallback: {error}");
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", args.port))
         .with_context(|| format!("failed to bind localhost port {}", args.port))?;
@@ -159,6 +163,24 @@ fn create_quick_workspace() -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&workspace)
         .with_context(|| format!("failed to create {}", workspace.display()))?;
     Ok(workspace)
+}
+
+fn render_quick_svg(workspace: &Path) -> anyhow::Result<()> {
+    let output = Command::new("dot")
+        .args(["-Tsvg", "graph.dot", "-o", "graph.svg"])
+        .current_dir(workspace)
+        .output()
+        .context("failed to launch Graphviz dot")?;
+
+    if !output.status.success() {
+        bail!(
+            "dot exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(())
 }
 
 fn open_default_browser(url: &str) -> anyhow::Result<()> {
@@ -214,6 +236,12 @@ fn handle_quick_request(mut stream: TcpStream, workspace: &Path) -> anyhow::Resu
             workspace.join("graph.dot"),
             "text/vnd.graphviz; charset=utf-8",
         )?,
+        "/graph.svg" => file_response(workspace.join("graph.svg"), "image/svg+xml; charset=utf-8")
+            .unwrap_or((
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                Vec::from("graph.svg not found\n"),
+            )),
         _ => (
             "404 Not Found",
             "text/plain; charset=utf-8",
