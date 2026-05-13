@@ -216,11 +216,27 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     #canvas {
+      position: relative;
       min-height: calc(100vh - 8rem);
-      overflow: auto;
+      overflow: hidden;
       border: 1px solid #6f7888;
       background: #dde5f4;
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+    }
+
+    #canvas.is-panning {
+      cursor: grabbing;
+    }
+
+    .graph-viewport {
+      display: inline-block;
+      min-width: 100%;
+      min-height: calc(100vh - 8rem);
+      transform-origin: 0 0;
+      will-change: transform;
     }
 
     #canvas svg {
@@ -277,6 +293,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       color: var(--muted);
     }
 
+    .hint {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
     @media (max-width: 720px) {
       header {
         align-items: start;
@@ -296,6 +317,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       <a href="/graph.svg">graph.svg</a>
       <a href="/graph.dot">graph.dot</a>
       <a href="/graph.json">graph.json</a>
+      <span class="hint">Wheel zoom / left-drag pan</span>
     </div>
     <section id="canvas" aria-label="Call graph">
       <div class="empty">Loading graph...</div>
@@ -304,6 +326,16 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
   <script>
     const canvas = document.querySelector("#canvas");
     const filter = document.querySelector("#filter");
+    const view = {
+      scale: 1,
+      offsetX: 0,
+      offsetY: 0,
+      isPanning: false,
+      startX: 0,
+      startY: 0,
+      startOffsetX: 0,
+      startOffsetY: 0
+    };
 
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (char) => ({
@@ -314,6 +346,94 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         "'": "&#39;"
       }[char]));
     }
+
+    function viewport() {
+      return document.querySelector("#viewport");
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function applyViewTransform() {
+      const target = viewport();
+      if (!target) {
+        return;
+      }
+
+      target.style.transform = `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`;
+    }
+
+    function resetView() {
+      view.scale = 1;
+      view.offsetX = 0;
+      view.offsetY = 0;
+      applyViewTransform();
+    }
+
+    function setGraphContent(html) {
+      canvas.innerHTML = `<div id="viewport" class="graph-viewport">${html}</div>`;
+      resetView();
+    }
+
+    canvas.addEventListener("wheel", (event) => {
+      if (!viewport()) {
+        return;
+      }
+
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const nextScale = clamp(view.scale * (event.deltaY < 0 ? 1.12 : 0.88), 0.2, 6);
+      const graphX = (pointerX - view.offsetX) / view.scale;
+      const graphY = (pointerY - view.offsetY) / view.scale;
+
+      view.scale = nextScale;
+      view.offsetX = pointerX - graphX * nextScale;
+      view.offsetY = pointerY - graphY * nextScale;
+      applyViewTransform();
+    }, { passive: false });
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || !viewport()) {
+        return;
+      }
+
+      event.preventDefault();
+      view.isPanning = true;
+      view.startX = event.clientX;
+      view.startY = event.clientY;
+      view.startOffsetX = view.offsetX;
+      view.startOffsetY = view.offsetY;
+      canvas.classList.add("is-panning");
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!view.isPanning) {
+        return;
+      }
+
+      view.offsetX = view.startOffsetX + event.clientX - view.startX;
+      view.offsetY = view.startOffsetY + event.clientY - view.startY;
+      applyViewTransform();
+    });
+
+    function stopPanning(event) {
+      if (!view.isPanning) {
+        return;
+      }
+
+      view.isPanning = false;
+      canvas.classList.remove("is-panning");
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+    }
+
+    canvas.addEventListener("pointerup", stopPanning);
+    canvas.addEventListener("pointercancel", stopPanning);
 
     function applySvgFilter() {
       const query = filter.value.trim().toLowerCase();
@@ -337,7 +457,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           return response.text();
         })
         .then((svg) => {
-          canvas.innerHTML = svg;
+          setGraphContent(svg);
           filter.addEventListener("input", applySvgFilter);
         });
     }
@@ -386,7 +506,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const height = Math.max(680, Math.max(...layerEntries.map(([, layer]) => layer.length)) * 120 + 160);
       const positions = new Map();
 
-      canvas.innerHTML = `<div class="fallback" style="width:${width}px;min-height:${height}px"><svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"><defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#934f12"></path></marker></defs><g id="edges"></g></svg></div>`;
+      setGraphContent(`<div class="fallback" style="width:${width}px;min-height:${height}px"><svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"><defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#934f12"></path></marker></defs><g id="edges"></g></svg></div>`);
       const fallback = canvas.querySelector(".fallback");
 
       layerEntries.forEach(([layerIndex, layer]) => {
@@ -479,5 +599,7 @@ mod tests {
         assert!(html.contains("<title>coviz quick</title>"));
         assert!(html.contains("0 functions / 0 calls"));
         assert!(html.contains("graph.svg"));
+        assert!(html.contains("Wheel zoom / left-drag pan"));
+        assert!(html.contains("graph-viewport"));
     }
 }
