@@ -1,0 +1,20 @@
+[package]
+name = "coviz"
+version = "0.1.0"
+edition = "2024"
+description = "Source code logic and call graph visualizer for Go and Rust."
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/coviz"
+keywords = ["callgraph", "visualization", "golang", "rust", "tree-sitter"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tree-sitter = "0.26.8"
+tree-sitter-go = "0.25.0"
+tree-sitter-rust = "0.24.2"
+walkdir = "2.5.0"

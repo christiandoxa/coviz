@@ -1,0 +1,327 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use tree_sitter::{Node, Parser};
+use walkdir::WalkDir;
+
+use crate::language::Language;
+use crate::model::{Analysis, Call, Function};
+
+#[derive(Debug, Clone)]
+struct SourceFile {
+    path: PathBuf,
+    display_path: String,
+    language: Language,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FunctionKey {
+    file: String,
+    line: usize,
+    name: String,
+}
+
+/// Analyze a source file or directory and resolve calls between discovered functions.
+pub fn analyze_path(input: impl AsRef<Path>, language: Option<Language>) -> Result<Analysis> {
+    let input = input.as_ref();
+    let files = discover_files(input, language)?;
+    let mut definitions = Vec::new();
+
+    for file in &files {
+        let source = fs::read(&file.path)
+            .with_context(|| format!("failed to read {}", file.path.display()))?;
+        let tree = parse_source(file.language, &source, &file.path)?;
+        collect_definitions(
+            tree.root_node(),
+            &source,
+            file.language,
+            &file.display_path,
+            &mut definitions,
+        );
+    }
+
+    definitions.sort();
+
+    let functions: Vec<Function> = definitions
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| Function {
+            id: format!("f{index}"),
+            name: definition.name.clone(),
+            file: definition.file.clone(),
+            line: definition.line,
+        })
+        .collect();
+
+    let mut id_by_definition = BTreeMap::new();
+    let mut id_by_name = BTreeMap::new();
+    for function in &functions {
+        let key = FunctionKey {
+            file: function.file.clone(),
+            line: function.line,
+            name: function.name.clone(),
+        };
+        id_by_definition.insert(key, function.id.clone());
+        id_by_name
+            .entry(function.name.clone())
+            .or_insert_with(|| function.id.clone());
+    }
+
+    let mut calls = Vec::new();
+    for file in &files {
+        let source = fs::read(&file.path)
+            .with_context(|| format!("failed to read {}", file.path.display()))?;
+        let tree = parse_source(file.language, &source, &file.path)?;
+        collect_calls(
+            tree.root_node(),
+            &source,
+            file.language,
+            &file.display_path,
+            None,
+            &id_by_definition,
+            &id_by_name,
+            &mut calls,
+        );
+    }
+
+    calls.sort_by(|left, right| {
+        left.caller
+            .cmp(&right.caller)
+            .then(left.callee.cmp(&right.callee))
+            .then(left.file.cmp(&right.file))
+            .then(left.line.cmp(&right.line))
+    });
+
+    Ok(Analysis { functions, calls })
+}
+
+fn discover_files(input: &Path, language: Option<Language>) -> Result<Vec<SourceFile>> {
+    if !input.exists() {
+        bail!("input path does not exist: {}", input.display());
+    }
+
+    let root = if input.is_file() {
+        input.parent().unwrap_or_else(|| Path::new(""))
+    } else {
+        input
+    };
+
+    let mut files = Vec::new();
+    if input.is_file() {
+        maybe_push_source_file(input, root, language, &mut files)?;
+    } else {
+        for entry in WalkDir::new(input).sort_by_file_name() {
+            let entry = entry.with_context(|| format!("failed to walk {}", input.display()))?;
+            if entry.file_type().is_file() {
+                maybe_push_source_file(entry.path(), root, language, &mut files)?;
+            }
+        }
+    }
+
+    files.sort_by(|left, right| left.display_path.cmp(&right.display_path));
+    Ok(files)
+}
+
+fn maybe_push_source_file(
+    path: &Path,
+    root: &Path,
+    requested_language: Option<Language>,
+    files: &mut Vec<SourceFile>,
+) -> Result<()> {
+    let Some(detected_language) = Language::from_extension(path) else {
+        return Ok(());
+    };
+
+    if requested_language.is_some_and(|language| language != detected_language) {
+        return Ok(());
+    }
+
+    files.push(SourceFile {
+        path: path.to_path_buf(),
+        display_path: display_path(path, root)?,
+        language: detected_language,
+    });
+    Ok(())
+}
+
+fn display_path(path: &Path, root: &Path) -> Result<String> {
+    let display_path = path.strip_prefix(root).unwrap_or(path);
+    let value = display_path
+        .to_str()
+        .with_context(|| format!("path is not valid UTF-8: {}", path.display()))?;
+    Ok(value.replace('\\', "/"))
+}
+
+fn parse_source(language: Language, source: &[u8], path: &Path) -> Result<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    let ts_language: tree_sitter::Language = match language {
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+    };
+    parser
+        .set_language(&ts_language)
+        .with_context(|| format!("failed to load {language} grammar"))?;
+
+    let tree = parser
+        .parse(source, None)
+        .with_context(|| format!("tree-sitter failed to parse {}", path.display()))?;
+    if tree.root_node().has_error() {
+        bail!("syntax errors found in {}", path.display());
+    }
+    Ok(tree)
+}
+
+fn collect_definitions(
+    node: Node<'_>,
+    source: &[u8],
+    language: Language,
+    file: &str,
+    definitions: &mut Vec<FunctionKey>,
+) {
+    if is_function_definition(language, node)
+        && let Some(name) = definition_name(node, source)
+    {
+        definitions.push(FunctionKey {
+            file: file.to_string(),
+            line: line_number(node),
+            name,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_definitions(child, source, language, file, definitions);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_calls(
+    node: Node<'_>,
+    source: &[u8],
+    language: Language,
+    file: &str,
+    current_function: Option<&str>,
+    id_by_definition: &BTreeMap<FunctionKey, String>,
+    id_by_name: &BTreeMap<String, String>,
+    calls: &mut Vec<Call>,
+) {
+    let mut active_function = current_function;
+    if is_function_definition(language, node)
+        && let Some(name) = definition_name(node, source)
+    {
+        let key = FunctionKey {
+            file: file.to_string(),
+            line: line_number(node),
+            name,
+        };
+        active_function = id_by_definition.get(&key).map(String::as_str);
+    }
+
+    if node.kind() == "call_expression"
+        && let (Some(caller), Some(callee_name)) = (active_function, call_simple_name(node, source))
+        && let Some(callee) = id_by_name.get(&callee_name)
+    {
+        calls.push(Call {
+            caller: caller.to_string(),
+            callee: callee.clone(),
+            file: file.to_string(),
+            line: line_number(node),
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(
+            child,
+            source,
+            language,
+            file,
+            active_function,
+            id_by_definition,
+            id_by_name,
+            calls,
+        );
+    }
+}
+
+fn is_function_definition(language: Language, node: Node<'_>) -> bool {
+    match language {
+        Language::Go => matches!(node.kind(), "function_declaration" | "method_declaration"),
+        Language::Rust => node.kind() == "function_item",
+    }
+}
+
+fn definition_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| node_text(name, source))
+}
+
+fn call_simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let function = node.child_by_field_name("function")?;
+    terminal_name(function, source)
+}
+
+fn terminal_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" => node_text(node, source),
+        "generic_function" => node
+            .child_by_field_name("function")
+            .and_then(|function| terminal_name(function, source)),
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|name| terminal_name(name, source))
+            .or_else(|| last_named_child_name(node, source)),
+        "selector_expression" | "field_expression" => node
+            .child_by_field_name("field")
+            .and_then(|field| terminal_name(field, source))
+            .or_else(|| last_named_child_name(node, source)),
+        _ => {
+            if node.named_child_count() == 1 {
+                node.named_child(0)
+                    .and_then(|child| terminal_name(child, source))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn last_named_child_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let count = node.named_child_count();
+    if count == 0 {
+        return None;
+    }
+    node.named_child((count - 1) as u32)
+        .and_then(|child| terminal_name(child, source))
+}
+
+fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    node.utf8_text(source).ok().map(str::to_string)
+}
+
+fn line_number(node: Node<'_>) -> usize {
+    node.start_position().row + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Language, display_path};
+    use std::path::Path;
+
+    #[test]
+    fn display_paths_use_forward_slashes() {
+        assert_eq!(
+            display_path(Path::new("fixtures/go/main.go"), Path::new("fixtures")).unwrap(),
+            "go/main.go"
+        );
+    }
+
+    #[test]
+    fn language_filter_ignores_mismatched_files() {
+        assert!(
+            Language::from_extension("main.go").is_some_and(|language| language != Language::Rust)
+        );
+    }
+}
