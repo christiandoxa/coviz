@@ -1,5 +1,6 @@
 use coviz::{
-    AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot, render_json,
+    AnalysisOptions, Language, analyze_path, analyze_path_with_options, model::CallKind,
+    render_dot, render_json,
 };
 
 #[test]
@@ -19,15 +20,15 @@ fn analyzes_go_fixture() {
         .map(|call| {
             let caller = function_name(&analysis, &call.caller);
             let callee = function_name(&analysis, &call.callee);
-            (caller, callee, call.line)
+            (caller, callee, call.line, call.kind)
         })
         .collect();
     assert_eq!(
         call_names,
         [
-            ("main", "serve", 4),
-            ("main", "worker", 5),
-            ("serve", "worker", 9),
+            ("main", "serve", 4, CallKind::Direct),
+            ("main", "worker", 5, CallKind::Direct),
+            ("serve", "worker", 9, CallKind::Direct),
         ]
     );
 }
@@ -49,15 +50,15 @@ fn analyzes_rust_fixture() {
         .map(|call| {
             let caller = function_name(&analysis, &call.caller);
             let callee = function_name(&analysis, &call.callee);
-            (caller, callee, call.line)
+            (caller, callee, call.line, call.kind)
         })
         .collect();
     assert_eq!(
         call_names,
         [
-            ("entry", "helper", 2),
-            ("entry", "target", 3),
-            ("helper", "target", 7),
+            ("entry", "helper", 2, CallKind::Direct),
+            ("entry", "target", 3, CallKind::Associated),
+            ("helper", "target", 7, CallKind::Direct),
         ]
     );
 }

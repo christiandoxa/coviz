@@ -9,6 +9,17 @@ pub struct Function {
     pub line: usize,
 }
 
+/// Syntax category for a resolved call expression.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallKind {
+    Direct,
+    Method,
+    Associated,
+    #[default]
+    Unknown,
+}
+
 /// Resolved call expression between two discovered functions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
@@ -16,6 +27,8 @@ pub struct Call {
     pub callee: String,
     pub file: String,
     pub line: usize,
+    #[serde(default)]
+    pub kind: CallKind,
 }
 
 /// Complete analysis result.
@@ -27,7 +40,7 @@ pub struct Analysis {
 
 #[cfg(test)]
 mod tests {
-    use super::{Analysis, Function};
+    use super::{Analysis, Call, CallKind, Function};
 
     #[test]
     fn analysis_defaults_to_empty_graph() {
@@ -47,5 +60,19 @@ mod tests {
         let json = serde_json::to_string(&function).unwrap();
         assert!(json.contains("\"id\":\"f0\""));
         assert!(json.contains("\"name\":\"main\""));
+    }
+
+    #[test]
+    fn call_kind_serializes_as_lowercase_metadata() {
+        let call = Call {
+            caller: "f0".to_string(),
+            callee: "f1".to_string(),
+            file: "main.rs".to_string(),
+            line: 3,
+            kind: CallKind::Associated,
+        };
+
+        let json = serde_json::to_string(&call).unwrap();
+        assert!(json.contains("\"kind\":\"associated\""));
     }
 }

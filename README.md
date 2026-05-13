@@ -61,12 +61,25 @@ Open a quick local browser viewer. The command writes temporary files under
 coviz quick ./src --language rust
 ```
 
-When Graphviz `dot` is installed, quick mode renders `graph.svg` with Graphviz
-for a cleaner clustered layout. Without Graphviz, it falls back to the built-in
-browser renderer.
+Quick mode analyzes files in parallel and avoids blocking startup on large
+Graphviz layouts. Graphviz `dot` is still used for cleaner clustered SVG output
+on small graphs, but `--graphviz auto` skips SVG rendering for large graphs
+because `dot` is single-threaded. Use `--graphviz always` to force SVG rendering
+in the background, or `--graphviz never` to disable Graphviz artifacts.
 
 Quick mode excludes common test files, Rust `#[cfg(test)]` code, `tests/`, and
 `target/` by default. Use `--include-tests` when you need those nodes.
+
+Quick mode also includes a productivity UI for exploring larger graphs:
+
+- Inspector panel with node details, callers, callees, and source context.
+- Resizable side panel for balancing the graph view and inspection details.
+- Minimap for keeping orientation while zooming or panning through dense graphs.
+- File filters and a hide-isolated toggle to reduce visual noise.
+- Search navigation for jumping between matching files, symbols, or calls.
+- Keyboard shortcuts for common navigation and view actions.
+- Layout presets for quickly switching graph organization.
+- Open and copy file-link actions for moving from a graph node back to source.
 
 Use automatic language detection and stdout:
 

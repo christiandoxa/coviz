@@ -3,11 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
 
 use crate::language::Language;
-use crate::model::{Analysis, Call, Function};
+use crate::model::{Analysis, Call, CallKind, Function};
 
 #[derive(Debug, Clone)]
 struct SourceFile {
@@ -21,6 +22,21 @@ struct FunctionKey {
     file: String,
     line: usize,
     name: String,
+}
+
+#[derive(Debug, Default)]
+struct ParsedFile {
+    definitions: Vec<FunctionKey>,
+    call_sites: Vec<CallSite>,
+}
+
+#[derive(Debug, Clone)]
+struct CallSite {
+    caller: FunctionKey,
+    callee_name: String,
+    file: String,
+    line: usize,
+    kind: CallKind,
 }
 
 /// Analyzer behavior toggles.
@@ -59,21 +75,15 @@ pub fn analyze_path_with_options(
 ) -> Result<Analysis> {
     let input = input.as_ref();
     let files = discover_files(input, language, options)?;
-    let mut definitions = Vec::new();
+    let parsed_files = files
+        .par_iter()
+        .map(|file| parse_file(file, options))
+        .collect::<Result<Vec<_>>>()?;
 
-    for file in &files {
-        let source = fs::read(&file.path)
-            .with_context(|| format!("failed to read {}", file.path.display()))?;
-        let tree = parse_source(file.language, &source, &file.path)?;
-        collect_definitions(
-            tree.root_node(),
-            &source,
-            file.language,
-            &file.display_path,
-            options,
-            &mut definitions,
-        );
-    }
+    let mut definitions: Vec<_> = parsed_files
+        .iter()
+        .flat_map(|file| file.definitions.iter().cloned())
+        .collect();
 
     definitions.sort();
 
@@ -102,23 +112,22 @@ pub fn analyze_path_with_options(
             .or_insert_with(|| function.id.clone());
     }
 
-    let mut calls = Vec::new();
-    for file in &files {
-        let source = fs::read(&file.path)
-            .with_context(|| format!("failed to read {}", file.path.display()))?;
-        let tree = parse_source(file.language, &source, &file.path)?;
-        collect_calls(
-            tree.root_node(),
-            &source,
-            file.language,
-            &file.display_path,
-            options,
-            None,
-            &id_by_definition,
-            &id_by_name,
-            &mut calls,
-        );
-    }
+    let mut calls: Vec<_> = parsed_files
+        .par_iter()
+        .flat_map_iter(|file| {
+            file.call_sites.iter().filter_map(|site| {
+                let caller = id_by_definition.get(&site.caller)?;
+                let callee = id_by_name.get(&site.callee_name)?;
+                Some(Call {
+                    caller: caller.clone(),
+                    callee: callee.clone(),
+                    file: site.file.clone(),
+                    line: site.line,
+                    kind: site.kind,
+                })
+            })
+        })
+        .collect();
 
     calls.sort_by(|left, right| {
         left.caller
@@ -253,86 +262,75 @@ fn parse_source(language: Language, source: &[u8], path: &Path) -> Result<tree_s
     Ok(tree)
 }
 
-fn collect_definitions(
-    node: Node<'_>,
-    source: &[u8],
-    language: Language,
-    file: &str,
-    options: AnalysisOptions,
-    definitions: &mut Vec<FunctionKey>,
-) {
-    if should_skip_node(language, node, source, options) {
-        return;
-    }
-
-    if is_function_definition(language, node)
-        && let Some(name) = definition_name(node, source)
-    {
-        definitions.push(FunctionKey {
-            file: file.to_string(),
-            line: line_number(node),
-            name,
-        });
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_definitions(child, source, language, file, options, definitions);
-    }
+fn parse_file(file: &SourceFile, options: AnalysisOptions) -> Result<ParsedFile> {
+    let source =
+        fs::read(&file.path).with_context(|| format!("failed to read {}", file.path.display()))?;
+    let tree = parse_source(file.language, &source, &file.path)?;
+    let mut parsed = ParsedFile::default();
+    collect_file_symbols(
+        tree.root_node(),
+        &source,
+        file.language,
+        &file.display_path,
+        options,
+        None,
+        &mut parsed,
+    );
+    Ok(parsed)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_calls(
+fn collect_file_symbols(
     node: Node<'_>,
     source: &[u8],
     language: Language,
     file: &str,
     options: AnalysisOptions,
-    current_function: Option<&str>,
-    id_by_definition: &BTreeMap<FunctionKey, String>,
-    id_by_name: &BTreeMap<String, String>,
-    calls: &mut Vec<Call>,
+    current_function: Option<&FunctionKey>,
+    parsed: &mut ParsedFile,
 ) {
     if should_skip_node(language, node, source, options) {
         return;
     }
 
-    let mut active_function = current_function;
-    if is_function_definition(language, node)
+    let active_function_key;
+    let active_function = if is_function_definition(language, node)
         && let Some(name) = definition_name(node, source)
     {
-        let key = FunctionKey {
+        active_function_key = FunctionKey {
             file: file.to_string(),
             line: line_number(node),
             name,
         };
-        active_function = id_by_definition.get(&key).map(String::as_str);
-    }
+        parsed.definitions.push(active_function_key.clone());
+        Some(&active_function_key)
+    } else {
+        current_function
+    };
 
-    if node.kind() == "call_expression"
-        && let (Some(caller), Some(callee_name)) = (active_function, call_simple_name(node, source))
-        && let Some(callee) = id_by_name.get(&callee_name)
-    {
-        calls.push(Call {
-            caller: caller.to_string(),
-            callee: callee.clone(),
-            file: file.to_string(),
-            line: line_number(node),
-        });
+    if node.kind() == "call_expression" {
+        let kind = call_kind(node);
+        if let (Some(caller), Some(callee_name)) = (active_function, call_simple_name(node, source))
+        {
+            parsed.call_sites.push(CallSite {
+                caller: caller.clone(),
+                callee_name,
+                file: file.to_string(),
+                line: line_number(node),
+                kind,
+            });
+        }
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(
+        collect_file_symbols(
             child,
             source,
             language,
             file,
             options,
             active_function,
-            id_by_definition,
-            id_by_name,
-            calls,
+            parsed,
         );
     }
 }
@@ -399,6 +397,33 @@ fn definition_name(node: Node<'_>, source: &[u8]) -> Option<String> {
 fn call_simple_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     let function = node.child_by_field_name("function")?;
     terminal_name(function, source)
+}
+
+fn call_kind(node: Node<'_>) -> CallKind {
+    node.child_by_field_name("function")
+        .map(call_function_kind)
+        .unwrap_or(CallKind::Unknown)
+}
+
+fn call_function_kind(node: Node<'_>) -> CallKind {
+    match node.kind() {
+        "identifier" => CallKind::Direct,
+        "selector_expression" | "field_expression" => CallKind::Method,
+        "scoped_identifier" => CallKind::Associated,
+        "generic_function" => node
+            .child_by_field_name("function")
+            .map(generic_call_function_kind)
+            .unwrap_or(CallKind::Unknown),
+        _ => CallKind::Unknown,
+    }
+}
+
+fn generic_call_function_kind(node: Node<'_>) -> CallKind {
+    match node.kind() {
+        "identifier" => CallKind::Direct,
+        "scoped_identifier" => CallKind::Associated,
+        _ => CallKind::Unknown,
+    }
 }
 
 fn terminal_name(node: Node<'_>, source: &[u8]) -> Option<String> {

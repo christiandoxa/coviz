@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use crate::model::{Analysis, Call, Function};
+use crate::model::{Analysis, Call, CallKind, Function};
 
 /// Render an analysis graph in Graphviz DOT format.
 pub fn render_dot(analysis: &Analysis) -> String {
@@ -57,10 +57,12 @@ pub fn render_dot(analysis: &Analysis) -> String {
 
     for call in &calls {
         output.push_str(&format!(
-            "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
+            "  \"{}\" -> \"{}\" [label=\"{}\", color=\"{}\", style=\"{}\"];\n",
             escape_dot(&call.caller),
             escape_dot(&call.callee),
             escape_dot(&call_label(call)),
+            call_color(call),
+            call_style(call),
         ));
     }
 
@@ -86,6 +88,23 @@ fn function_label(function: &Function) -> String {
 
 fn call_label(call: &Call) -> String {
     format!("{}:{}", call.file, call.line)
+}
+
+fn call_color(call: &Call) -> &'static str {
+    match call.kind {
+        CallKind::Direct => "#934f12",
+        CallKind::Method => "#1d6f8f",
+        CallKind::Associated => "#6d4aa1",
+        CallKind::Unknown => "#6f7888",
+    }
+}
+
+fn call_style(call: &Call) -> &'static str {
+    match call.kind {
+        CallKind::Direct | CallKind::Associated => "solid",
+        CallKind::Method => "dashed",
+        CallKind::Unknown => "dotted",
+    }
 }
 
 fn cluster_label(file: &str) -> String {
@@ -147,6 +166,8 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       --panel-strong: #fff8d4;
       --line: #8b95a7;
       --accent: #934f12;
+      --accent-2: #1d6f8f;
+      --accent-3: #6d4aa1;
     }
 
     * {
@@ -201,7 +222,8 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       margin-bottom: 1rem;
     }
 
-    input {
+    input,
+    select {
       width: min(34rem, 100%);
       border: 1px solid var(--line);
       border-radius: 0.35rem;
@@ -209,6 +231,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       color: var(--ink);
       padding: 0.65rem 0.8rem;
       font: inherit;
+    }
+
+    select {
+      width: auto;
+      max-width: 13rem;
     }
 
     a {
@@ -238,6 +265,63 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     button.active {
       background: #f7c873;
+      border-color: var(--accent);
+    }
+
+    .toolbar-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      align-items: center;
+    }
+
+    .search-tools {
+      display: flex;
+      min-width: min(36rem, 100%);
+      flex: 1 1 28rem;
+      gap: 0.35rem;
+      align-items: center;
+    }
+
+    .search-tools input {
+      flex: 1 1 18rem;
+      min-width: 12rem;
+    }
+
+    .icon-button {
+      min-width: 2.45rem;
+      padding-inline: 0.65rem;
+    }
+
+    .count-pill {
+      min-width: 4.2rem;
+      color: var(--muted);
+      font-size: 0.86rem;
+      text-align: center;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin: -0.4rem 0 0.75rem;
+    }
+
+    .chip {
+      border: 1px solid #9aa4b5;
+      border-radius: 999px;
+      background: #eef3ff;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 700;
+      padding: 0.35rem 0.58rem;
+    }
+
+    .chip.active {
+      background: #fff8d4;
+      color: var(--ink);
       border-color: var(--accent);
     }
 
@@ -298,9 +382,87 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       stroke-width: 2.6px;
     }
 
+    #canvas svg .edge.kind-direct path,
+    #canvas svg .edge.kind-direct polygon,
+    #canvas line.edge.kind-direct {
+      stroke: var(--accent);
+    }
+
+    #canvas svg .edge.kind-method path,
+    #canvas svg .edge.kind-method polygon,
+    #canvas line.edge.kind-method {
+      stroke: var(--accent-2);
+      stroke-dasharray: 6 4;
+    }
+
+    #canvas svg .edge.kind-associated path,
+    #canvas svg .edge.kind-associated polygon,
+    #canvas line.edge.kind-associated {
+      stroke: var(--accent-3);
+    }
+
+    #canvas svg .edge.kind-unknown path,
+    #canvas svg .edge.kind-unknown polygon,
+    #canvas line.edge.kind-unknown {
+      stroke: #6f7888;
+      stroke-dasharray: 2 4;
+    }
+
+    #canvas svg .edge.selected path,
+    #canvas svg .edge.selected polygon {
+      stroke: #d12f1f;
+      fill: #d12f1f;
+    }
+
+    #canvas line.edge.selected {
+      stroke: #d12f1f;
+    }
+
     #canvas svg .dimmed,
     #canvas svg .edge.dimmed {
       opacity: 0.12;
+    }
+
+    #canvas .filtered-out {
+      display: none;
+    }
+
+    .minimap {
+      position: absolute;
+      right: 0.85rem;
+      bottom: 0.85rem;
+      z-index: 3;
+      width: 12rem;
+      height: 8rem;
+      overflow: hidden;
+      border: 1px solid #6f7888;
+      background: rgba(238, 243, 255, 0.9);
+      box-shadow: 0 0.35rem 1rem rgba(16, 19, 26, 0.18);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .minimap-graph {
+      position: absolute;
+      inset: 0;
+      transform-origin: 0 0;
+      opacity: 0.72;
+      pointer-events: none;
+    }
+
+    .minimap-graph svg {
+      display: block;
+      width: auto;
+      height: auto;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .minimap-window {
+      position: absolute;
+      border: 2px solid #d12f1f;
+      background: rgba(209, 47, 31, 0.12);
+      pointer-events: none;
     }
 
     .fallback {
@@ -442,6 +604,52 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       color: var(--accent);
     }
 
+    .breadcrumb {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      align-items: center;
+      margin: 0.5rem 0 0.85rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .breadcrumb button {
+      max-width: 100%;
+      overflow: hidden;
+      padding: 0.32rem 0.5rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .source-actions,
+    .source-modes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin: 0.55rem 0;
+    }
+
+    .source-actions button,
+    .source-actions a,
+    .source-modes button {
+      border: 1px solid var(--line);
+      border-radius: 0.35rem;
+      background: #fff8d4;
+      color: var(--ink);
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.84rem;
+      font-weight: 700;
+      min-height: 2rem;
+      padding: 0.38rem 0.55rem;
+    }
+
+    .source-modes button.active {
+      background: #f7c873;
+      border-color: var(--accent);
+    }
+
     pre.source {
       background: #111827;
       border-radius: 0.45rem;
@@ -460,6 +668,25 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     .source-line {
       display: block;
+    }
+
+    .line-number {
+      color: #94a3b8;
+      user-select: none;
+    }
+
+    .source-line .kw {
+      color: #facc15;
+      font-weight: 700;
+    }
+
+    .source-line .str {
+      color: #86efac;
+    }
+
+    .source-line .com {
+      color: #9ca3af;
+      font-style: italic;
     }
 
     @media (max-width: 720px) {
@@ -496,15 +723,33 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
   <main>
     <section class="workspace">
       <div class="toolbar">
-        <input id="filter" type="search" placeholder="Filter function or file" autocomplete="off">
-        <button id="reset-view" type="button">Reset view</button>
-        <button id="isolate" type="button">Isolate selected</button>
-        <a href="/graph.svg">graph.svg</a>
-        <a href="/graph.dot">graph.dot</a>
-        <a href="/graph.json">graph.json</a>
-        <a href="/source.json">source.json</a>
-        <span class="hint">Wheel zoom / left-drag pan / click inspect</span>
+        <div class="search-tools">
+          <input id="filter" type="search" placeholder="Filter function or file" autocomplete="off">
+          <button id="search-prev" class="icon-button" type="button" title="Previous match">Prev</button>
+          <button id="search-next" class="icon-button" type="button" title="Next match">Next</button>
+          <span id="search-count" class="count-pill">0 / 0</span>
+        </div>
+        <div class="toolbar-group">
+          <select id="layout-preset" aria-label="Layout preset">
+            <option value="all">All calls</option>
+            <option value="by-file">Group by file</option>
+            <option value="fan-in">Fan-in only</option>
+            <option value="fan-out">Fan-out only</option>
+            <option value="cycles">Cycles</option>
+          </select>
+          <button id="reset-view" type="button">Reset view</button>
+          <button id="isolate" type="button">Isolate selected</button>
+          <button id="hide-isolated" type="button">Hide isolated</button>
+        </div>
+        <div class="toolbar-group">
+          <a href="/graph.svg">graph.svg</a>
+          <a href="/graph.dot">graph.dot</a>
+          <a href="/graph.json">graph.json</a>
+          <a href="/source.json">source.json</a>
+        </div>
+        <span class="hint">Wheel zoom / left-drag pan / click inspect / press ? shortcuts</span>
       </div>
+      <div id="file-filters" class="chips" aria-label="File filters"></div>
       <section id="canvas" aria-label="Call graph">
         <div class="empty">Loading graph...</div>
       </section>
@@ -518,19 +763,34 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
   <script>
     const canvas = document.querySelector("#canvas");
     const filter = document.querySelector("#filter");
+    const searchPrevButton = document.querySelector("#search-prev");
+    const searchNextButton = document.querySelector("#search-next");
+    const searchCount = document.querySelector("#search-count");
+    const fileFilters = document.querySelector("#file-filters");
     const inspector = document.querySelector("#inspector");
     const splitter = document.querySelector("#splitter");
     const resetButton = document.querySelector("#reset-view");
     const isolateButton = document.querySelector("#isolate");
+    const hideIsolatedButton = document.querySelector("#hide-isolated");
+    const layoutPreset = document.querySelector("#layout-preset");
     const state = {
       graph: { functions: [], calls: [] },
       functions: new Map(),
       sources: new Map(),
+      files: new Map(),
+      allFiles: [],
+      activeFiles: new Set(),
       incoming: new Map(),
       outgoing: new Map(),
+      callsByEdge: new Map(),
       selectedNode: null,
       selectedEdge: null,
-      isolate: false
+      isolate: false,
+      hideIsolated: false,
+      preset: "all",
+      searchMatches: [],
+      searchIndex: -1,
+      sourceMode: "context"
     };
     const view = {
       scale: 1,
@@ -610,6 +870,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }
 
       target.style.transform = `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`;
+      updateMinimap();
     }
 
     function resetView() {
@@ -620,7 +881,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function setGraphContent(html) {
-      canvas.innerHTML = `<div id="viewport" class="graph-viewport">${html}</div>`;
+      canvas.innerHTML = `
+        <div id="viewport" class="graph-viewport">${html}</div>
+        <div id="minimap" class="minimap" aria-label="Graph minimap" title="Click or drag to move the viewport">
+          <div id="minimap-graph" class="minimap-graph"></div>
+          <div id="minimap-window" class="minimap-window"></div>
+        </div>
+      `;
       resetView();
     }
 
@@ -628,13 +895,211 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       state.graph = graph;
       state.functions = new Map(graph.functions.map((item) => [item.id, item]));
       state.sources = new Map((source.functions || []).map((item) => [item.id, item]));
+      state.files = new Map((source.files || []).map((item) => [item.file, item]));
+      state.allFiles = [...new Set(graph.functions.map((item) => item.file))].sort();
+      state.activeFiles = new Set(state.allFiles);
       state.incoming = new Map(graph.functions.map((item) => [item.id, []]));
       state.outgoing = new Map(graph.functions.map((item) => [item.id, []]));
+      state.callsByEdge = new Map();
 
       graph.calls.forEach((call) => {
         state.outgoing.get(call.caller)?.push(call);
         state.incoming.get(call.callee)?.push(call);
+        if (!state.callsByEdge.has(edgeKey(call))) {
+          state.callsByEdge.set(edgeKey(call), []);
+        }
+        state.callsByEdge.get(edgeKey(call)).push(call);
       });
+
+      renderFileFilters();
+    }
+
+    function fileLabel(file) {
+      const parts = String(file).split("/");
+      if (parts.length <= 2) {
+        return file;
+      }
+      return `${parts.at(-2)}/${parts.at(-1)}`;
+    }
+
+    function renderFileFilters() {
+      if (!state.allFiles.length) {
+        fileFilters.innerHTML = "";
+        return;
+      }
+
+      const allActive = state.activeFiles.size === state.allFiles.length;
+      fileFilters.innerHTML = `
+        <button class="chip ${allActive ? "active" : ""}" type="button" data-file-action="all">All files</button>
+        <button class="chip" type="button" data-file-action="none">None</button>
+        ${state.allFiles.map((file) => `
+          <button class="chip ${state.activeFiles.has(file) ? "active" : ""}" type="button" data-file="${escapeHtml(file)}" title="${escapeHtml(file)}">
+            ${escapeHtml(fileLabel(file))}
+          </button>
+        `).join("")}
+      `;
+    }
+
+    function callKind(call) {
+      return call?.kind || "unknown";
+    }
+
+    function callKindLabel(call) {
+      return callKind(call).replace(/^\w/, (value) => value.toUpperCase());
+    }
+
+    function edgeCalls(key) {
+      return state.callsByEdge.get(key) || [];
+    }
+
+    function firstEdgeCall(key) {
+      return edgeCalls(key)[0] || null;
+    }
+
+    function isIsolated(id) {
+      return !(state.incoming.get(id) || []).length && !(state.outgoing.get(id) || []).length;
+    }
+
+    function hasCycleEdge(call) {
+      if (!call) {
+        return false;
+      }
+      if (call.caller === call.callee) {
+        return true;
+      }
+      return state.graph.calls.some((candidate) => candidate.caller === call.callee && candidate.callee === call.caller);
+    }
+
+    function passesPreset(id) {
+      if (state.preset === "fan-in") {
+        return (state.incoming.get(id) || []).length > 0;
+      }
+      if (state.preset === "fan-out") {
+        return (state.outgoing.get(id) || []).length > 0;
+      }
+      if (state.preset === "cycles") {
+        return (state.incoming.get(id) || []).some(hasCycleEdge) || (state.outgoing.get(id) || []).some(hasCycleEdge);
+      }
+      return true;
+    }
+
+    function edgePassesPreset(call, caller, callee) {
+      if (state.preset === "fan-in") {
+        return (state.incoming.get(callee) || []).length > 0;
+      }
+      if (state.preset === "fan-out") {
+        return (state.outgoing.get(caller) || []).length > 0;
+      }
+      if (state.preset === "cycles") {
+        return hasCycleEdge(call);
+      }
+      return true;
+    }
+
+    function nodeBaseVisible(id) {
+      const item = state.functions.get(id);
+      if (!item) {
+        return true;
+      }
+      if (!state.activeFiles.has(item.file)) {
+        return false;
+      }
+      return !(state.hideIsolated && isIsolated(id));
+    }
+
+    function edgeBaseVisible(call, caller, callee) {
+      return nodeBaseVisible(caller) && nodeBaseVisible(callee);
+    }
+
+    function graphElementBounds() {
+      const target = viewport();
+      if (!target) {
+        return { width: 1, height: 1 };
+      }
+
+      const svg = target.querySelector("svg");
+      if (svg?.viewBox?.baseVal?.width && svg?.viewBox?.baseVal?.height) {
+        return {
+          width: svg.viewBox.baseVal.width,
+          height: svg.viewBox.baseVal.height
+        };
+      }
+
+      const fallback = target.querySelector(".fallback");
+      if (fallback) {
+        return {
+          width: fallback.offsetWidth || fallback.scrollWidth || 1,
+          height: fallback.offsetHeight || fallback.scrollHeight || 1
+        };
+      }
+
+      return {
+        width: target.scrollWidth || target.offsetWidth || 1,
+        height: target.scrollHeight || target.offsetHeight || 1
+      };
+    }
+
+    function renderMinimap() {
+      const minimapGraph = document.querySelector("#minimap-graph");
+      const target = viewport();
+      if (!minimapGraph || !target) {
+        return;
+      }
+
+      const svg = target.querySelector("svg");
+      if (svg) {
+        const clone = svg.cloneNode(true);
+        clone.removeAttribute("width");
+        clone.removeAttribute("height");
+        minimapGraph.replaceChildren(clone);
+      } else {
+        minimapGraph.innerHTML = "";
+      }
+      updateMinimap();
+    }
+
+    function updateMinimap() {
+      const minimap = document.querySelector("#minimap");
+      const minimapGraph = document.querySelector("#minimap-graph");
+      const windowBox = document.querySelector("#minimap-window");
+      if (!minimap || !minimapGraph || !windowBox || !viewport()) {
+        return;
+      }
+
+      const graph = graphElementBounds();
+      const scale = Math.min(minimap.clientWidth / graph.width, minimap.clientHeight / graph.height);
+      const graphWidth = graph.width * scale;
+      const graphHeight = graph.height * scale;
+      const graphLeft = (minimap.clientWidth - graphWidth) / 2;
+      const graphTop = (minimap.clientHeight - graphHeight) / 2;
+      minimapGraph.style.transform = `translate(${graphLeft}px, ${graphTop}px) scale(${scale})`;
+
+      const left = graphLeft + (-view.offsetX / view.scale) * scale;
+      const top = graphTop + (-view.offsetY / view.scale) * scale;
+      const width = (canvas.clientWidth / view.scale) * scale;
+      const height = (canvas.clientHeight / view.scale) * scale;
+      windowBox.style.left = `${clamp(left, 0, minimap.clientWidth)}px`;
+      windowBox.style.top = `${clamp(top, 0, minimap.clientHeight)}px`;
+      windowBox.style.width = `${clamp(width, 8, minimap.clientWidth)}px`;
+      windowBox.style.height = `${clamp(height, 8, minimap.clientHeight)}px`;
+    }
+
+    function panFromMinimap(event) {
+      const minimap = document.querySelector("#minimap");
+      if (!minimap || !viewport()) {
+        return;
+      }
+
+      const rect = minimap.getBoundingClientRect();
+      const graph = graphElementBounds();
+      const scale = Math.min(minimap.clientWidth / graph.width, minimap.clientHeight / graph.height);
+      const graphLeft = (minimap.clientWidth - graph.width * scale) / 2;
+      const graphTop = (minimap.clientHeight - graph.height * scale) / 2;
+      const graphX = clamp((event.clientX - rect.left - graphLeft) / scale, 0, graph.width);
+      const graphY = clamp((event.clientY - rect.top - graphTop) / scale, 0, graph.height);
+      view.offsetX = canvas.clientWidth / 2 - graphX * view.scale;
+      view.offsetY = canvas.clientHeight / 2 - graphY * view.scale;
+      applyViewTransform();
     }
 
     function renderHome() {
@@ -665,21 +1130,81 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return `<ul class="call-list">${calls.map((call) => {
         const target = direction === "out" ? call.callee : call.caller;
         const item = state.functions.get(target);
-        return `<li data-node-id="${target}" data-edge-key="${edgeKey(call)}">${escapeHtml(item?.name || target)}<br><span class="muted">${escapeHtml(call.file)}:${call.line}</span></li>`;
+        return `<li data-node-id="${target}" data-edge-key="${edgeKey(call)}">${escapeHtml(item?.name || target)}<br><span class="muted">${escapeHtml(call.file)}:${call.line} · ${escapeHtml(callKindLabel(call))}</span></li>`;
       }).join("")}</ul>`;
     }
 
-    function renderSource(id) {
+    function highlightCode(text) {
+      const html = escapeHtml(text);
+      const commentIndex = html.indexOf("//");
+      const code = commentIndex >= 0 ? html.slice(0, commentIndex) : html;
+      const comment = commentIndex >= 0 ? html.slice(commentIndex) : "";
+      const highlighted = code
+        .replace(/(&quot;.*?&quot;)/g, '<span class="str">$1</span>')
+        .replace(/\b(async|await|break|const|continue|crate|else|enum|fn|for|if|impl|let|loop|match|mod|mut|pub|return|self|Self|struct|trait|type|use|where|while)\b/g, '<span class="kw">$1</span>');
+      return comment ? `${highlighted}<span class="com">${comment}</span>` : highlighted;
+    }
+
+    function sourceLinesFor(id) {
       const source = state.sources.get(id);
       if (!source || !source.lines.length) {
+        return null;
+      }
+
+      const file = state.files.get(source.file);
+      const allLines = file?.lines?.length ? file.lines : source.lines;
+      const radius = state.sourceMode === "wide" ? 20 : 5;
+      const lines = state.sourceMode === "full"
+        ? allLines
+        : allLines.filter((line) => Math.abs(line.number - source.line) <= radius);
+
+      return { source, file, lines };
+    }
+
+    function renderSource(id) {
+      const context = sourceLinesFor(id);
+      if (!context) {
         return '<p class="muted">Source snippet unavailable.</p>';
       }
 
-      return `<pre class="source">${source.lines.map((line) => {
+      const { source, file, lines } = context;
+      const absolutePath = file?.absolute_path || source.file;
+      const openUrl = `vscode://file/${encodeURI(absolutePath)}:${source.line}`;
+      return `
+        <div class="source-actions">
+          <button type="button" data-copy-text="${escapeHtml(`${absolutePath}:${source.line}`)}">Copy path</button>
+          <a href="${escapeHtml(openUrl)}">Open in editor</a>
+        </div>
+        <div class="source-modes" aria-label="Source context size">
+          <button type="button" class="${state.sourceMode === "context" ? "active" : ""}" data-source-mode="context">±5 lines</button>
+          <button type="button" class="${state.sourceMode === "wide" ? "active" : ""}" data-source-mode="wide">±20 lines</button>
+          <button type="button" class="${state.sourceMode === "full" ? "active" : ""}" data-source-mode="full">Full file</button>
+        </div>
+        <pre class="source">${lines.map((line) => {
         const number = String(line.number).padStart(4, " ");
         const focus = line.number === source.line ? " focus" : "";
-        return `<span class="source-line${focus}">${number}  ${escapeHtml(line.text)}</span>`;
-      }).join("")}</pre>`;
+        return `<span class="source-line${focus}"><span class="line-number">${number}</span>  ${highlightCode(line.text)}</span>`;
+      }).join("")}</pre>
+      `;
+    }
+
+    function renderBreadcrumb(id) {
+      const current = state.functions.get(id);
+      if (!current) {
+        return "";
+      }
+
+      const incoming = state.incoming.get(id) || [];
+      const outgoing = state.outgoing.get(id) || [];
+      const caller = incoming[0] ? state.functions.get(incoming[0].caller) : null;
+      const callee = outgoing[0] ? state.functions.get(outgoing[0].callee) : null;
+      return `
+        <div class="breadcrumb" aria-label="Selection path">
+          ${caller ? `<button type="button" data-node-id="${caller.id}" title="${escapeHtml(caller.file)}:${caller.line}">${escapeHtml(caller.name)}</button><span>-></span>` : ""}
+          <strong title="${escapeHtml(current.file)}:${current.line}">${escapeHtml(current.name)}</strong>
+          ${callee ? `<span>-></span><button type="button" data-node-id="${callee.id}" title="${escapeHtml(callee.file)}:${callee.line}">${escapeHtml(callee.name)}</button>` : ""}
+        </div>
+      `;
     }
 
     function renderNodeInspector(id) {
@@ -694,6 +1219,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       inspector.innerHTML = `
         <h2>${escapeHtml(item.name)}</h2>
         <p class="muted">${escapeHtml(item.file)}:${item.line}</p>
+        ${renderBreadcrumb(id)}
         <div class="stat-grid">
           <div class="stat"><strong>${incoming.length}</strong><span>incoming</span></div>
           <div class="stat"><strong>${outgoing.length}</strong><span>outgoing</span></div>
@@ -717,7 +1243,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         <p><strong>${escapeHtml(callerItem?.name || caller)}</strong> -> <strong>${escapeHtml(calleeItem?.name || callee)}</strong></p>
         <h3>Call sites</h3>
         <ul class="call-list">
-          ${calls.map((call) => `<li data-node-id="${caller}" data-edge-key="${key}">${escapeHtml(call.file)}:${call.line}</li>`).join("")}
+          ${calls.map((call) => `<li data-node-id="${caller}" data-edge-key="${key}">${escapeHtml(call.file)}:${call.line}<br><span class="muted">${escapeHtml(callKindLabel(call))} call</span></li>`).join("")}
         </ul>
         <h3>Caller source</h3>
         ${renderSource(caller)}
@@ -764,14 +1290,76 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return ids;
     }
 
+    function nodeMatchesQuery(id, query) {
+      return !query || functionLabel(id).toLowerCase().includes(query);
+    }
+
+    function edgeMatchesQuery(call, caller, callee, query) {
+      if (!query) {
+        return true;
+      }
+      const label = `${functionLabel(caller)} ${functionLabel(callee)} ${call?.file || ""}`.toLowerCase();
+      return label.includes(query);
+    }
+
+    function updateSearchMatches(query) {
+      state.searchMatches = [...state.functions.keys()].filter((id) => nodeBaseVisible(id) && passesPreset(id) && nodeMatchesQuery(id, query));
+      if (!query || !state.searchMatches.length) {
+        state.searchIndex = -1;
+      } else if (state.selectedNode && state.searchMatches.includes(state.selectedNode)) {
+        state.searchIndex = state.searchMatches.indexOf(state.selectedNode);
+      } else if (state.searchIndex < 0 || state.searchIndex >= state.searchMatches.length) {
+        state.searchIndex = 0;
+      }
+
+      searchCount.textContent = query ? `${Math.max(state.searchIndex + 1, 0)} / ${state.searchMatches.length}` : `${state.searchMatches.length} nodes`;
+    }
+
+    function centerNode(id) {
+      const node = [...document.querySelectorAll("#canvas .node")].find((element) => {
+        const nodeId = element.dataset.id || element.querySelector?.("title")?.textContent;
+        return nodeId === id;
+      });
+      if (!node) {
+        return;
+      }
+
+      const canvasRect = canvas.getBoundingClientRect();
+      const nodeRect = node.getBoundingClientRect();
+      const nodeX = nodeRect.left - canvasRect.left + nodeRect.width / 2;
+      const nodeY = nodeRect.top - canvasRect.top + nodeRect.height / 2;
+      view.offsetX += canvas.clientWidth / 2 - nodeX;
+      view.offsetY += canvas.clientHeight / 2 - nodeY;
+      applyViewTransform();
+    }
+
+    function focusSearchMatch(delta) {
+      const query = filter.value.trim().toLowerCase();
+      updateSearchMatches(query);
+      if (!state.searchMatches.length) {
+        return;
+      }
+
+      state.searchIndex = (state.searchIndex + delta + state.searchMatches.length) % state.searchMatches.length;
+      const id = state.searchMatches[state.searchIndex];
+      selectNode(id);
+      centerNode(id);
+    }
+
     function applyGraphState() {
       const query = filter.value.trim().toLowerCase();
+      updateSearchMatches(query);
       const isolated = neighborhood();
 
       document.querySelectorAll("#canvas .node").forEach((node) => {
         const id = node.dataset.id || node.querySelector?.("title")?.textContent;
-        const label = functionLabel(id).toLowerCase();
-        const dim = (query && !label.includes(query)) || (isolated && !isolated.has(id));
+        const visible = nodeBaseVisible(id);
+        const dim = visible && (
+          !passesPreset(id)
+          || !nodeMatchesQuery(id, query)
+          || (isolated && !isolated.has(id))
+        );
+        node.classList.toggle("filtered-out", !visible);
         node.classList.toggle("dimmed", Boolean(dim));
         node.classList.toggle("selected", id === state.selectedNode);
       });
@@ -779,14 +1367,23 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       document.querySelectorAll("#canvas .edge").forEach((edge) => {
         const key = edge.dataset.edge || edge.querySelector?.("title")?.textContent;
         const { caller, callee } = splitEdgeKey(key);
-        const label = `${functionLabel(caller)} ${functionLabel(callee)}`.toLowerCase();
-        const dim = (query && !label.includes(query))
-          || (isolated && !(isolated.has(caller) && isolated.has(callee)));
+        const call = firstEdgeCall(key);
+        const visible = edgeBaseVisible(call, caller, callee);
+        const dim = visible && (
+          !edgePassesPreset(call, caller, callee)
+          || !edgeMatchesQuery(call, caller, callee, query)
+          || (isolated && !(isolated.has(caller) && isolated.has(callee)))
+        );
+        edge.classList.toggle("filtered-out", !visible);
         edge.classList.toggle("dimmed", Boolean(dim));
         edge.classList.toggle("selected", key === state.selectedEdge);
       });
 
       isolateButton.classList.toggle("active", state.isolate);
+      hideIsolatedButton.classList.toggle("active", state.hideIsolated);
+      layoutPreset.value = state.preset;
+      renderFileFilters();
+      updateMinimap();
     }
 
     function wireGraphElements() {
@@ -795,8 +1392,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       });
       document.querySelectorAll("#canvas svg .edge").forEach((edge) => {
         edge.dataset.edge = edge.querySelector("title")?.textContent || "";
+        const call = firstEdgeCall(edge.dataset.edge);
+        edge.classList.add(`kind-${callKind(call)}`);
       });
       applyGraphState();
+      renderMinimap();
     }
 
     canvas.addEventListener("wheel", (event) => {
@@ -819,7 +1419,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }, { passive: false });
 
     canvas.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || !viewport()) {
+      if (event.button !== 0 || !viewport() || event.target.closest?.("#minimap")) {
         return;
       }
 
@@ -901,14 +1501,71 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     splitter.addEventListener("pointerup", stopResizing);
     splitter.addEventListener("pointercancel", stopResizing);
     splitter.addEventListener("dblclick", () => setInspectorWidth(384));
-    window.addEventListener("resize", () => setInspectorWidth(inspector.getBoundingClientRect().width, false));
-    filter.addEventListener("input", applyGraphState);
-    resetButton.addEventListener("click", resetView);
+    window.addEventListener("resize", () => {
+      setInspectorWidth(inspector.getBoundingClientRect().width, false);
+      updateMinimap();
+    });
+    filter.addEventListener("input", () => {
+      state.searchIndex = 0;
+      applyGraphState();
+    });
+    searchPrevButton.addEventListener("click", () => focusSearchMatch(-1));
+    searchNextButton.addEventListener("click", () => focusSearchMatch(1));
+    resetButton.addEventListener("click", () => {
+      state.isolate = false;
+      resetView();
+      applyGraphState();
+    });
     isolateButton.addEventListener("click", () => {
       state.isolate = !state.isolate;
       applyGraphState();
     });
+    hideIsolatedButton.addEventListener("click", () => {
+      state.hideIsolated = !state.hideIsolated;
+      applyGraphState();
+    });
+    layoutPreset.addEventListener("change", () => {
+      state.preset = layoutPreset.value;
+      applyGraphState();
+    });
+    fileFilters.addEventListener("click", (event) => {
+      const item = event.target.closest("button");
+      if (!item) {
+        return;
+      }
+
+      if (item.dataset.fileAction === "all") {
+        state.activeFiles = new Set(state.allFiles);
+      } else if (item.dataset.fileAction === "none") {
+        state.activeFiles = new Set();
+      } else if (item.dataset.file) {
+        if (state.activeFiles.has(item.dataset.file)) {
+          state.activeFiles.delete(item.dataset.file);
+        } else {
+          state.activeFiles.add(item.dataset.file);
+        }
+      }
+      applyGraphState();
+    });
     inspector.addEventListener("click", (event) => {
+      const sourceMode = event.target.closest("[data-source-mode]");
+      if (sourceMode) {
+        state.sourceMode = sourceMode.dataset.sourceMode;
+        if (state.selectedNode) {
+          renderNodeInspector(state.selectedNode);
+        } else if (state.selectedEdge) {
+          renderEdgeInspector(state.selectedEdge);
+        }
+        return;
+      }
+
+      const copy = event.target.closest("[data-copy-text]");
+      if (copy) {
+        navigator.clipboard?.writeText(copy.dataset.copyText);
+        copy.textContent = "Copied";
+        return;
+      }
+
       const item = event.target.closest("[data-node-id]");
       if (!item) {
         return;
@@ -917,6 +1574,74 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         state.selectedEdge = item.dataset.edgeKey;
       }
       selectNode(item.dataset.nodeId);
+    });
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || !event.target.closest?.("#minimap")) {
+        return;
+      }
+
+      event.preventDefault();
+      view.isMiniPanning = true;
+      panFromMinimap(event);
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (view.isMiniPanning) {
+        panFromMinimap(event);
+      }
+    });
+    canvas.addEventListener("pointerup", (event) => {
+      if (!view.isMiniPanning) {
+        return;
+      }
+      view.isMiniPanning = false;
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.target.matches?.("input, textarea, select")) {
+        if (event.key === "Escape") {
+          event.target.blur();
+        }
+        return;
+      }
+
+      if (event.key === "/") {
+        event.preventDefault();
+        filter.focus();
+      } else if (event.key === "Escape") {
+        filter.value = "";
+        state.isolate = false;
+        applyGraphState();
+      } else if (event.key === "r") {
+        resetView();
+      } else if (event.key === "i") {
+        state.isolate = !state.isolate;
+        applyGraphState();
+      } else if (event.key === "h") {
+        state.hideIsolated = !state.hideIsolated;
+        applyGraphState();
+      } else if (event.key === "n" || event.key === "]") {
+        focusSearchMatch(1);
+      } else if (event.key === "p" || event.key === "[") {
+        focusSearchMatch(-1);
+      } else if (event.key === "?") {
+        inspector.innerHTML = `
+          <h2>Shortcuts</h2>
+          <ul class="call-list">
+            <li><strong>/</strong><br><span class="muted">Focus search</span></li>
+            <li><strong>n / ]</strong><br><span class="muted">Next search match</span></li>
+            <li><strong>p / [</strong><br><span class="muted">Previous search match</span></li>
+            <li><strong>i</strong><br><span class="muted">Toggle isolate selected</span></li>
+            <li><strong>h</strong><br><span class="muted">Toggle hide isolated</span></li>
+            <li><strong>r</strong><br><span class="muted">Reset view</span></li>
+            <li><strong>Esc</strong><br><span class="muted">Clear filter and isolate</span></li>
+          </ul>
+        `;
+      }
     });
 
     function renderSvg() {
@@ -949,19 +1674,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         outgoing.get(call.caller)?.push(call.callee);
       });
 
-      const depth = new Map();
-      const queue = nodes.filter((node) => (incoming.get(node.id) || 0) === 0).map((node) => node.id);
-      nodes.forEach((node) => depth.set(node.id, 0));
-
-      for (const id of queue) {
-        const nextDepth = (depth.get(id) || 0) + 1;
-        (outgoing.get(id) || []).forEach((callee) => {
-          if (nextDepth > (depth.get(callee) || 0)) {
-            depth.set(callee, nextDepth);
-            queue.push(callee);
-          }
-        });
-      }
+      const depth = layoutDepths(nodes, calls, incoming, outgoing);
 
       const layers = new Map();
       nodes.forEach((node) => {
@@ -1005,7 +1718,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         }
 
         const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-        line.classList.add("edge");
+        line.classList.add("edge", `kind-${callKind(call)}`);
         line.dataset.edge = edgeKey(call);
         line.setAttribute("x1", caller.x);
         line.setAttribute("y1", caller.y);
@@ -1017,6 +1730,41 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         edgeLayer.appendChild(line);
       });
       applyGraphState();
+      renderMinimap();
+    }
+
+    function layoutDepths(nodes, calls, incoming, outgoing) {
+      const largeGraph = nodes.length > 1500 || calls.length > 3000;
+      if (largeGraph) {
+        const files = [...new Set(nodes.map((node) => node.file))].sort();
+        const fileIndex = new Map(files.map((file, index) => [file, index]));
+        return new Map(nodes.map((node) => [node.id, fileIndex.get(node.file) || 0]));
+      }
+
+      const depth = new Map(nodes.map((node) => [node.id, 0]));
+      const roots = nodes.filter((node) => (incoming.get(node.id) || 0) === 0).map((node) => node.id);
+      const queue = roots.length ? roots : nodes.slice(0, 64).map((node) => node.id);
+      const seen = new Set(queue);
+
+      for (let cursor = 0; cursor < queue.length; cursor += 1) {
+        const id = queue[cursor];
+        const nextDepth = (depth.get(id) || 0) + 1;
+        (outgoing.get(id) || []).forEach((callee) => {
+          if (!seen.has(callee)) {
+            seen.add(callee);
+            depth.set(callee, nextDepth);
+            queue.push(callee);
+          }
+        });
+      }
+
+      nodes.forEach((node, index) => {
+        if (!seen.has(node.id)) {
+          depth.set(node.id, Math.min(index, 12));
+        }
+      });
+
+      return depth;
     }
 
     Promise.all([
@@ -1078,5 +1826,11 @@ mod tests {
         assert!(html.contains("Inspector"));
         assert!(html.contains("Resize inspector"));
         assert!(html.contains("coviz.quick.inspectorWidth"));
+        assert!(html.contains("Graph minimap"));
+        assert!(html.contains("Hide isolated"));
+        assert!(html.contains("layout-preset"));
+        assert!(html.contains("search-next"));
+        assert!(html.contains("Open in editor"));
+        assert!(html.contains("data-source-mode=\"wide\""));
     }
 }

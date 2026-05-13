@@ -1,10 +1,12 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -13,7 +15,13 @@ use coviz::{
     Analysis, AnalysisOptions, Language, analyze_path, analyze_path_with_options, render_dot,
     render_html, render_json,
 };
+use rayon::prelude::*;
 use serde::Serialize;
+
+const GRAPHVIZ_SYNC_FUNCTION_LIMIT: usize = 350;
+const GRAPHVIZ_SYNC_CALL_LIMIT: usize = 700;
+const GRAPHVIZ_AUTO_FUNCTION_LIMIT: usize = 1_500;
+const GRAPHVIZ_AUTO_CALL_LIMIT: usize = 3_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -76,6 +84,10 @@ struct QuickArgs {
     /// Include test files and Rust #[cfg(test)] code.
     #[arg(long)]
     include_tests: bool,
+
+    /// Graphviz SVG rendering strategy. Auto skips SVG for large graphs.
+    #[arg(long, value_enum, default_value_t = QuickGraphviz::Auto)]
+    graphviz: QuickGraphviz,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -99,6 +111,21 @@ impl CliLanguage {
 enum OutputFormat {
     Dot,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum QuickGraphviz {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GraphvizPlan {
+    Sync,
+    BackgroundSvg,
+    BackgroundDotOnly,
+    Skip,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -131,30 +158,57 @@ fn run_graph(args: GraphArgs) -> anyhow::Result<()> {
 }
 
 fn run_quick(args: QuickArgs) -> anyhow::Result<()> {
+    let started_at = Instant::now();
     let options = if args.include_tests {
         AnalysisOptions::default()
     } else {
         AnalysisOptions::without_tests()
     };
+    eprintln!("coviz quick: analyzing {}", args.input.display());
+    let analysis_started_at = Instant::now();
     let analysis =
         analyze_path_with_options(&args.input, args.language.into_analysis_language(), options)
             .with_context(|| format!("failed to analyze {}", args.input.display()))?;
+    eprintln!(
+        "coviz quick: analyzed {} functions / {} calls in {:.2}s",
+        analysis.functions.len(),
+        analysis.calls.len(),
+        analysis_started_at.elapsed().as_secs_f32()
+    );
 
     let workspace = create_quick_workspace()?;
-    let dot = render_dot(&analysis);
     fs::write(workspace.join("index.html"), render_html(&analysis))
         .with_context(|| format!("failed to write quick viewer in {}", workspace.display()))?;
-    fs::write(workspace.join("graph.json"), render_json(&analysis)?)
-        .with_context(|| format!("failed to write graph.json in {}", workspace.display()))?;
+    fs::write(
+        workspace.join("graph.json"),
+        serde_json::to_string(&analysis)?,
+    )
+    .with_context(|| format!("failed to write graph.json in {}", workspace.display()))?;
     fs::write(
         workspace.join("source.json"),
         render_source_index(&analysis, &args.input)?,
     )
     .with_context(|| format!("failed to write source.json in {}", workspace.display()))?;
-    fs::write(workspace.join("graph.dot"), &dot)
-        .with_context(|| format!("failed to write graph.dot in {}", workspace.display()))?;
-    if let Err(error) = render_quick_svg(&workspace) {
-        eprintln!("failed to render Graphviz SVG, using browser fallback: {error}");
+
+    let graphviz_plan = quick_graphviz_plan(args.graphviz, &analysis);
+    match graphviz_plan {
+        GraphvizPlan::Sync => {
+            if let Err(error) = write_quick_dot_artifacts(&workspace, &analysis, true) {
+                eprintln!("failed to render Graphviz SVG, using browser fallback: {error}");
+            }
+        }
+        GraphvizPlan::BackgroundSvg => {
+            spawn_quick_dot_task(workspace.clone(), analysis.clone(), true);
+        }
+        GraphvizPlan::BackgroundDotOnly => {
+            eprintln!(
+                "coviz quick: graph is large, skipping Graphviz SVG in auto mode (use --graphviz always to force it)"
+            );
+            spawn_quick_dot_task(workspace.clone(), analysis.clone(), false);
+        }
+        GraphvizPlan::Skip => {
+            eprintln!("coviz quick: Graphviz disabled");
+        }
     }
 
     let listener = TcpListener::bind(("127.0.0.1", args.port))
@@ -163,6 +217,10 @@ fn run_quick(args: QuickArgs) -> anyhow::Result<()> {
 
     println!("coviz quick workspace: {}", workspace.display());
     println!("coviz quick viewer: {url}");
+    eprintln!(
+        "coviz quick: viewer ready in {:.2}s",
+        started_at.elapsed().as_secs_f32()
+    );
 
     if !args.no_open
         && let Err(error) = open_default_browser(&url)
@@ -184,9 +242,39 @@ fn create_quick_workspace() -> anyhow::Result<PathBuf> {
     Ok(workspace)
 }
 
+fn quick_graphviz_plan(mode: QuickGraphviz, analysis: &Analysis) -> GraphvizPlan {
+    match mode {
+        QuickGraphviz::Never => GraphvizPlan::Skip,
+        QuickGraphviz::Always => GraphvizPlan::BackgroundSvg,
+        QuickGraphviz::Auto
+            if analysis.functions.len() <= GRAPHVIZ_SYNC_FUNCTION_LIMIT
+                && analysis.calls.len() <= GRAPHVIZ_SYNC_CALL_LIMIT =>
+        {
+            GraphvizPlan::Sync
+        }
+        QuickGraphviz::Auto
+            if analysis.functions.len() <= GRAPHVIZ_AUTO_FUNCTION_LIMIT
+                && analysis.calls.len() <= GRAPHVIZ_AUTO_CALL_LIMIT =>
+        {
+            GraphvizPlan::BackgroundSvg
+        }
+        QuickGraphviz::Auto => GraphvizPlan::BackgroundDotOnly,
+    }
+}
+
+fn spawn_quick_dot_task(workspace: PathBuf, analysis: Analysis, render_svg: bool) {
+    thread::spawn(move || {
+        if let Err(error) = write_quick_dot_artifacts(&workspace, &analysis, render_svg) {
+            eprintln!("coviz quick: failed to write Graphviz artifacts: {error}");
+        }
+    });
+}
+
 #[derive(Debug, Serialize)]
 struct SourceIndex {
+    root: String,
     functions: Vec<FunctionSource>,
+    files: Vec<FileSource>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +292,13 @@ struct SourceLine {
     text: String,
 }
 
+#[derive(Debug, Serialize)]
+struct FileSource {
+    file: String,
+    absolute_path: String,
+    lines: Vec<SourceLine>,
+}
+
 fn render_source_index(analysis: &Analysis, input: &Path) -> anyhow::Result<String> {
     let input = input
         .canonicalize()
@@ -217,27 +312,58 @@ fn render_source_index(analysis: &Analysis, input: &Path) -> anyhow::Result<Stri
         input
     };
 
+    let unique_files: Vec<_> = analysis
+        .functions
+        .iter()
+        .map(|function| function.file.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let file_sources: BTreeMap<String, FileSource> = unique_files
+        .par_iter()
+        .map(|file| {
+            let path = root.join(file);
+            let source = fs::read(&path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let lines = source
+                .lines()
+                .enumerate()
+                .map(|(index, text)| SourceLine {
+                    number: index + 1,
+                    text: text.to_string(),
+                })
+                .collect();
+            (
+                file.clone(),
+                FileSource {
+                    file: file.clone(),
+                    absolute_path: path.display().to_string(),
+                    lines,
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect();
+
     let mut functions = Vec::with_capacity(analysis.functions.len());
     for function in &analysis.functions {
-        let path = root.join(&function.file);
-        let source = fs::read(&path)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
         let snippet_start = function.line.saturating_sub(5).max(1);
         let snippet_end = function.line + 5;
-        let lines = source
-            .lines()
-            .enumerate()
-            .filter_map(|(index, text)| {
-                let number = index + 1;
-                (snippet_start..=snippet_end)
-                    .contains(&number)
-                    .then(|| SourceLine {
-                        number,
-                        text: text.to_string(),
+        let lines = file_sources
+            .get(&function.file)
+            .map(|file| {
+                file.lines
+                    .iter()
+                    .filter(|line| (snippet_start..=snippet_end).contains(&line.number))
+                    .map(|line| SourceLine {
+                        number: line.number,
+                        text: line.text.clone(),
                     })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         functions.push(FunctionSource {
             id: function.id.clone(),
@@ -248,7 +374,27 @@ fn render_source_index(analysis: &Analysis, input: &Path) -> anyhow::Result<Stri
         });
     }
 
-    Ok(serde_json::to_string_pretty(&SourceIndex { functions })?)
+    Ok(serde_json::to_string(&SourceIndex {
+        root: root.display().to_string(),
+        functions,
+        files: file_sources.into_values().collect(),
+    })?)
+}
+
+fn write_quick_dot_artifacts(
+    workspace: &Path,
+    analysis: &Analysis,
+    render_svg: bool,
+) -> anyhow::Result<()> {
+    let dot = render_dot(analysis);
+    fs::write(workspace.join("graph.dot"), &dot)
+        .with_context(|| format!("failed to write graph.dot in {}", workspace.display()))?;
+
+    if render_svg {
+        render_quick_svg(workspace)?;
+    }
+
+    Ok(())
 }
 
 fn render_quick_svg(workspace: &Path) -> anyhow::Result<()> {
@@ -363,4 +509,54 @@ fn write_http_response(
     )
     .context("failed to write HTTP headers")?;
     stream.write_all(body).context("failed to write HTTP body")
+}
+
+#[cfg(test)]
+mod tests {
+    use coviz::Function;
+
+    use super::{
+        GRAPHVIZ_AUTO_FUNCTION_LIMIT, GRAPHVIZ_SYNC_FUNCTION_LIMIT, GraphvizPlan, QuickGraphviz,
+        quick_graphviz_plan,
+    };
+
+    #[test]
+    fn auto_graphviz_plan_skips_svg_for_large_graphs() {
+        let analysis = coviz::Analysis {
+            functions: (0..=GRAPHVIZ_AUTO_FUNCTION_LIMIT)
+                .map(|index| Function {
+                    id: format!("f{index}"),
+                    name: format!("function_{index}"),
+                    file: "src/lib.rs".to_string(),
+                    line: index + 1,
+                })
+                .collect(),
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            quick_graphviz_plan(QuickGraphviz::Auto, &analysis),
+            GraphvizPlan::BackgroundDotOnly
+        );
+    }
+
+    #[test]
+    fn auto_graphviz_plan_keeps_small_graphs_synchronous() {
+        let analysis = coviz::Analysis {
+            functions: (0..GRAPHVIZ_SYNC_FUNCTION_LIMIT)
+                .map(|index| Function {
+                    id: format!("f{index}"),
+                    name: format!("function_{index}"),
+                    file: "src/lib.rs".to_string(),
+                    line: index + 1,
+                })
+                .collect(),
+            calls: Vec::new(),
+        };
+
+        assert_eq!(
+            quick_graphviz_plan(QuickGraphviz::Auto, &analysis),
+            GraphvizPlan::Sync
+        );
+    }
 }
