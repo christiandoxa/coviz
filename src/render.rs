@@ -275,6 +275,18 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       align-items: center;
     }
 
+    .path-input {
+      width: 11rem;
+      padding: 0.52rem 0.65rem;
+    }
+
+    .range-label {
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 700;
+      min-width: 4.5rem;
+    }
+
     .search-tools {
       display: flex;
       min-width: min(36rem, 100%);
@@ -429,13 +441,38 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     #canvas svg .edge.selected path,
-    #canvas svg .edge.selected polygon {
+    #canvas svg .edge.selected polygon,
+    #canvas svg .edge.path path,
+    #canvas svg .edge.path polygon {
       stroke: #d12f1f;
       fill: #d12f1f;
     }
 
-    #canvas line.edge.selected {
+    #canvas line.edge.selected,
+    #canvas line.edge.path {
       stroke: #d12f1f;
+    }
+
+    #canvas svg .node.path ellipse,
+    #canvas svg .node.path polygon,
+    #canvas svg .node.path path,
+    #canvas svg .node.hovered ellipse,
+    #canvas svg .node.hovered polygon,
+    #canvas svg .node.hovered path {
+      stroke: #d12f1f;
+      stroke-width: 3px;
+    }
+
+    #canvas svg .node.trace ellipse,
+    #canvas svg .node.trace polygon,
+    #canvas svg .node.trace path {
+      fill: #b9e1ea;
+    }
+
+    .node.path,
+    .node.hovered {
+      outline: 3px solid #d12f1f;
+      outline-offset: 3px;
     }
 
     #canvas svg .dimmed,
@@ -756,6 +793,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         <div class="toolbar-group">
           <select id="layout-preset" aria-label="Layout preset">
             <option value="all">All calls</option>
+            <option value="trace">Trace flow</option>
             <option value="by-folder">By folder flow</option>
             <option value="by-file">By file flow</option>
             <option value="fan-in">Fan-in only</option>
@@ -765,6 +803,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           <button id="reset-view" type="button">Reset view</button>
           <button id="isolate" type="button">Isolate selected</button>
           <button id="hide-isolated" type="button">Hide isolated</button>
+        </div>
+        <div class="toolbar-group">
+          <button id="trace-entry" type="button" title="Trace from project entrypoint">Entry flow</button>
+          <button id="trace-selected" type="button" title="Trace from selected function">Trace selected</button>
+          <label class="range-label" for="trace-depth">Depth <span id="trace-depth-value">3</span></label>
+          <input id="trace-depth" type="range" min="1" max="12" value="3" title="Trace depth">
+        </div>
+        <div class="toolbar-group">
+          <input id="path-from" class="path-input" type="search" placeholder="Path from" autocomplete="off">
+          <input id="path-to" class="path-input" type="search" placeholder="Path to" autocomplete="off">
+          <button id="find-path" type="button">Find path</button>
+          <button id="clear-path" type="button">Clear path</button>
+          <button id="collapse-clusters" type="button">Collapse</button>
+          <button id="expand-clusters" type="button">Expand</button>
         </div>
         <div class="toolbar-group">
           <a href="/graph.svg">graph.svg</a>
@@ -798,6 +850,16 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     const isolateButton = document.querySelector("#isolate");
     const hideIsolatedButton = document.querySelector("#hide-isolated");
     const layoutPreset = document.querySelector("#layout-preset");
+    const traceEntryButton = document.querySelector("#trace-entry");
+    const traceSelectedButton = document.querySelector("#trace-selected");
+    const traceDepthInput = document.querySelector("#trace-depth");
+    const traceDepthValue = document.querySelector("#trace-depth-value");
+    const pathFromInput = document.querySelector("#path-from");
+    const pathToInput = document.querySelector("#path-to");
+    const findPathButton = document.querySelector("#find-path");
+    const clearPathButton = document.querySelector("#clear-path");
+    const collapseClustersButton = document.querySelector("#collapse-clusters");
+    const expandClustersButton = document.querySelector("#expand-clusters");
     const state = {
       graph: { functions: [], calls: [] },
       functions: new Map(),
@@ -811,9 +873,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       selectedNode: null,
       selectedEdge: null,
       selectedGroup: null,
+      hoverNode: null,
+      hoverEdge: null,
       isolate: false,
       hideIsolated: false,
       preset: "all",
+      entrypointNode: null,
+      traceRoot: null,
+      traceDepth: 3,
+      traceCache: null,
+      pathFrom: null,
+      pathTo: null,
+      pathNodes: new Set(),
+      pathEdges: new Set(),
+      collapsedFiles: new Set(),
       searchMatches: [],
       searchIndex: -1,
       sourceMode: "context",
@@ -829,7 +902,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       startY: 0,
       startOffsetX: 0,
       startOffsetY: 0,
-      startTarget: null
+      startTarget: null,
+      redrawPending: false,
+      minimapPending: false,
+      lastWheelAt: 0,
+      wheelSettleTimer: null
     };
 
     function escapeHtml(value) {
@@ -890,6 +967,236 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return item ? `${item.name} ${item.file}:${item.line}` : id;
     }
 
+    function invalidateTrace() {
+      state.traceCache = null;
+    }
+
+    function functionSearchText(item) {
+      return `${item?.name || ""} ${item?.file || ""}:${item?.line || ""}`.toLowerCase();
+    }
+
+    function findFunctionByQuery(query) {
+      const value = String(query || "").trim().toLowerCase();
+      if (!value) {
+        return null;
+      }
+
+      const items = [...state.functions.values()];
+      return items.find((item) => item.id.toLowerCase() === value)
+        || items.find((item) => item.name.toLowerCase() === value)
+        || items.find((item) => `${item.file}:${item.line}`.toLowerCase() === value)
+        || items.find((item) => functionSearchText(item).includes(value))
+        || null;
+    }
+
+    function defaultEntrypointId() {
+      const ranked = [...state.functions.values()]
+        .sort((left, right) =>
+          entrypointRankForFunction(left) - entrypointRankForFunction(right)
+          || (state.outgoing.get(right.id) || []).length - (state.outgoing.get(left.id) || []).length
+          || left.file.localeCompare(right.file)
+          || left.line - right.line
+        );
+      return ranked[0]?.id || null;
+    }
+
+    function setTraceRoot(id) {
+      state.traceRoot = id || state.entrypointNode || defaultEntrypointId();
+      state.preset = "trace";
+      state.selectedGroup = null;
+      invalidateTrace();
+      if (state.traceRoot) {
+        state.selectedNode = state.traceRoot;
+        state.selectedEdge = null;
+        renderNodeInspector(state.traceRoot);
+      }
+      applyGraphState();
+    }
+
+    function traceGraph() {
+      const root = state.traceRoot || state.entrypointNode || defaultEntrypointId();
+      const depthLimit = Number(state.traceDepth) || 3;
+      const cacheKey = `${root}|${depthLimit}`;
+      if (state.traceCache?.key === cacheKey) {
+        return state.traceCache;
+      }
+
+      const nodes = new Set();
+      const edges = new Set();
+      const depth = new Map();
+      if (!root) {
+        state.traceCache = { key: cacheKey, root, nodes, edges, depth };
+        return state.traceCache;
+      }
+
+      const queue = [root];
+      nodes.add(root);
+      depth.set(root, 0);
+      for (let cursor = 0; cursor < queue.length; cursor += 1) {
+        const id = queue[cursor];
+        const currentDepth = depth.get(id) || 0;
+        if (currentDepth >= depthLimit) {
+          continue;
+        }
+        for (const call of state.outgoing.get(id) || []) {
+          edges.add(edgeKey(call));
+          nodes.add(call.callee);
+          if (!depth.has(call.callee)) {
+            depth.set(call.callee, currentDepth + 1);
+            queue.push(call.callee);
+          }
+        }
+      }
+
+      state.traceCache = { key: cacheKey, root, nodes, edges, depth };
+      return state.traceCache;
+    }
+
+    function findShortestPath(fromId, toId) {
+      if (!fromId || !toId) {
+        return null;
+      }
+      const queue = [fromId];
+      const previous = new Map([[fromId, null]]);
+      const previousEdge = new Map();
+
+      for (let cursor = 0; cursor < queue.length; cursor += 1) {
+        const id = queue[cursor];
+        if (id === toId) {
+          break;
+        }
+        for (const call of state.outgoing.get(id) || []) {
+          if (previous.has(call.callee)) {
+            continue;
+          }
+          previous.set(call.callee, id);
+          previousEdge.set(call.callee, edgeKey(call));
+          queue.push(call.callee);
+        }
+      }
+
+      if (!previous.has(toId)) {
+        return null;
+      }
+
+      const nodes = [];
+      const edges = [];
+      for (let id = toId; id; id = previous.get(id)) {
+        nodes.push(id);
+        const key = previousEdge.get(id);
+        if (key) {
+          edges.push(key);
+        }
+      }
+      nodes.reverse();
+      edges.reverse();
+      return { nodes, edges };
+    }
+
+    function setPath(fromId, toId) {
+      const result = findShortestPath(fromId, toId);
+      state.pathFrom = fromId;
+      state.pathTo = toId;
+      state.pathNodes = new Set(result?.nodes || []);
+      state.pathEdges = new Set(result?.edges || []);
+      const fromItem = state.functions.get(fromId);
+      const toItem = state.functions.get(toId);
+      pathFromInput.value = fromItem?.name || fromId || "";
+      pathToInput.value = toItem?.name || toId || "";
+      if (result) {
+        for (const id of result.nodes) {
+          const item = state.functions.get(id);
+          if (item) {
+            state.collapsedFiles.delete(item.file);
+          }
+        }
+        renderFileFilters();
+      }
+      if (fromId) {
+        state.selectedNode = fromId;
+        state.selectedEdge = null;
+        renderPathInspector(result, fromId, toId);
+        applyGraphState();
+        centerNode(fromId);
+      } else {
+        applyGraphState();
+      }
+    }
+
+    function clearPath() {
+      state.pathFrom = null;
+      state.pathTo = null;
+      state.pathNodes = new Set();
+      state.pathEdges = new Set();
+      pathFromInput.value = "";
+      pathToInput.value = "";
+      applyGraphState();
+    }
+
+    function edgeInPath(callOrKey) {
+      const key = typeof callOrKey === "string" ? callOrKey : edgeKey(callOrKey);
+      return state.pathEdges.has(key);
+    }
+
+    function nodeInPath(id) {
+      return state.pathNodes.has(id);
+    }
+
+    function activeTraceGraph() {
+      return state.preset === "trace" ? traceGraph() : null;
+    }
+
+    function nodeInActiveTrace(id) {
+      const trace = activeTraceGraph();
+      return !trace || trace.nodes.has(id);
+    }
+
+    function edgeInActiveTrace(callOrKey) {
+      const trace = activeTraceGraph();
+      if (!trace) {
+        return true;
+      }
+      const key = typeof callOrKey === "string" ? callOrKey : edgeKey(callOrKey);
+      return trace.edges.has(key);
+    }
+
+    function hasFocusedCanvasCalls() {
+      return Boolean(state.pathEdges.size || state.selectedNode || state.selectedEdge || state.hoverNode);
+    }
+
+    function canvasInteractionActive() {
+      return Boolean(view.isPanning || view.isMiniPanning || performance.now() - (view.lastWheelAt || 0) < 180);
+    }
+
+    function fileCollapsed(file) {
+      return state.collapsedFiles.has(file);
+    }
+
+    function scheduleCanvasDraw() {
+      if (!state.canvasRenderer?.canvas) {
+        return;
+      }
+      if (view.redrawPending) {
+        return;
+      }
+      view.redrawPending = true;
+      requestAnimationFrame(() => {
+        view.redrawPending = false;
+        drawCanvasGraph();
+      });
+    }
+
+    function scheduleMinimapUpdate() {
+      if (view.minimapPending) {
+        return;
+      }
+      view.minimapPending = true;
+      requestAnimationFrame(() => {
+        view.minimapPending = false;
+        updateMinimap();
+      });
+    }
+
     function applyViewTransform() {
       const target = viewport();
       if (!target) {
@@ -898,11 +1205,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
       if (state.canvasRenderer) {
         target.style.transform = "";
-        drawCanvasGraph();
+        scheduleCanvasDraw();
       } else {
         target.style.transform = `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`;
       }
-      updateMinimap();
+      scheduleMinimapUpdate();
     }
 
     function resetView() {
@@ -944,6 +1251,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         state.callsByEdge.get(edgeKey(call)).push(call);
       });
 
+      state.entrypointNode = defaultEntrypointId();
+      state.traceRoot = state.entrypointNode;
+      invalidateTrace();
       renderFileFilters();
     }
 
@@ -962,12 +1272,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }
 
       const allActive = state.activeFiles.size === state.allFiles.length;
+      const collapsedCount = state.collapsedFiles.size;
       fileFilters.innerHTML = `
         <button class="chip ${allActive ? "active" : ""}" type="button" data-file-action="all">All files</button>
         <button class="chip" type="button" data-file-action="none">None</button>
+        <span class="count-pill">${collapsedCount} collapsed</span>
         ${state.allFiles.map((file) => `
           <button class="chip ${state.activeFiles.has(file) ? "active" : ""}" type="button" data-file="${escapeHtml(file)}" title="${escapeHtml(file)}">
-            ${escapeHtml(fileLabel(file))}
+            ${escapeHtml(fileLabel(file))}${state.collapsedFiles.has(file) ? " +" : ""}
           </button>
         `).join("")}
       `;
@@ -1004,6 +1316,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function passesPreset(id) {
+      if (state.preset === "trace") {
+        return traceGraph().nodes.has(id);
+      }
       if (state.preset === "fan-in") {
         return (state.incoming.get(id) || []).length > 0;
       }
@@ -1017,6 +1332,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function edgePassesPreset(call, caller, callee) {
+      if (state.preset === "trace") {
+        return traceGraph().edges.has(edgeKey(call));
+      }
       if (state.preset === "fan-in") {
         return (state.incoming.get(callee) || []).length > 0;
       }
@@ -1042,6 +1360,30 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     function edgeBaseVisible(call, caller, callee) {
       return nodeBaseVisible(caller) && nodeBaseVisible(callee);
+    }
+
+    function nodeRenderVisible(id) {
+      const item = state.functions.get(id);
+      return nodeBaseVisible(id) && !(item && fileCollapsed(item.file));
+    }
+
+    function nodeDisplayVisible(id) {
+      return nodeRenderVisible(id) && nodeInActiveTrace(id);
+    }
+
+    function edgeTouchesCollapsedFile(call) {
+      const caller = state.functions.get(call.caller);
+      const callee = state.functions.get(call.callee);
+      return Boolean((caller && fileCollapsed(caller.file)) || (callee && fileCollapsed(callee.file)));
+    }
+
+    function callDisplayVisible(call) {
+      return Boolean(
+        call
+        && edgeBaseVisible(call, call.caller, call.callee)
+        && !edgeTouchesCollapsedFile(call)
+        && edgeInActiveTrace(call)
+      );
     }
 
     function activeGroupMode() {
@@ -1296,6 +1638,12 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       inspector.innerHTML = `
         <h2>${escapeHtml(item.name)}</h2>
         <p class="muted">${escapeHtml(item.file)}:${item.line}</p>
+        <div class="source-actions">
+          <button type="button" data-trace-node="${id}">Trace from here</button>
+          <button type="button" data-path-from="${id}">Path from</button>
+          <button type="button" data-path-to="${id}">Path to</button>
+          <button type="button" data-collapse-file="${escapeHtml(item.file)}">${state.collapsedFiles.has(item.file) ? "Expand file" : "Collapse file"}</button>
+        </div>
         ${renderBreadcrumb(id)}
         <div class="stat-grid">
           <div class="stat"><strong>${incoming.length}</strong><span>incoming</span></div>
@@ -1324,6 +1672,39 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         </ul>
         <h3>Caller source</h3>
         ${renderSource(caller)}
+      `;
+    }
+
+    function renderPathInspector(result, fromId, toId) {
+      const from = state.functions.get(fromId);
+      const to = state.functions.get(toId);
+      if (!result) {
+        inspector.innerHTML = `
+          <h2>Path finder</h2>
+          <p>No path found from <strong>${escapeHtml(from?.name || fromId)}</strong> to <strong>${escapeHtml(to?.name || toId)}</strong>.</p>
+          <p class="muted">Try a broader target name or use Trace selected from the source function.</p>
+        `;
+        return;
+      }
+
+      inspector.innerHTML = `
+        <h2>Path finder</h2>
+        <p class="muted">${result.nodes.length} functions / ${result.edges.length} calls</p>
+        <div class="breadcrumb" aria-label="Found path">
+          ${result.nodes.map((id, index) => {
+            const item = state.functions.get(id);
+            return `${index ? "<span>-></span>" : ""}<button type="button" data-node-id="${id}" title="${escapeHtml(item?.file || "")}:${item?.line || ""}">${escapeHtml(item?.name || id)}</button>`;
+          }).join("")}
+        </div>
+        <h3>Path steps</h3>
+        <ul class="call-list">
+          ${result.edges.map((key) => {
+            const { caller, callee } = splitEdgeKey(key);
+            const callerItem = state.functions.get(caller);
+            const calleeItem = state.functions.get(callee);
+            return `<li data-node-id="${callee}" data-edge-key="${key}">${escapeHtml(callerItem?.name || caller)} -> ${escapeHtml(calleeItem?.name || callee)}<br><span class="muted">${escapeHtml(calleeItem?.file || "")}:${calleeItem?.line || ""}</span></li>`;
+          }).join("")}
+        </ul>
       `;
     }
 
@@ -1382,6 +1763,10 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function selectNode(id) {
+      const item = state.functions.get(id);
+      if (item && state.collapsedFiles.delete(item.file)) {
+        renderFileFilters();
+      }
       state.selectedNode = id;
       state.selectedEdge = null;
       state.selectedGroup = null;
@@ -1431,6 +1816,17 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           const hit = hitCanvasNode(clientX, clientY);
           if (hit) {
             selectNode(hit);
+            return;
+          }
+          const file = hitCanvasFileCluster(clientX, clientY);
+          if (file) {
+            if (state.collapsedFiles.has(file)) {
+              state.collapsedFiles.delete(file);
+            } else {
+              state.collapsedFiles.add(file);
+            }
+            renderFileFilters();
+            applyGraphState();
           }
         }
         return;
@@ -1472,14 +1868,40 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const rect = canvas.getBoundingClientRect();
       const graphX = (clientX - rect.left - view.offsetX) / view.scale;
       const graphY = (clientY - rect.top - view.offsetY) / view.scale;
+      const isolated = neighborhood();
       for (const [id, point] of renderer.positions) {
-        if (!nodeBaseVisible(id)) {
+        const visible = isolated ? nodeBaseVisible(id) && isolated.has(id) : nodeDisplayVisible(id);
+        if (!visible) {
           continue;
         }
         const dx = Math.abs(graphX - point.x);
         const dy = Math.abs(graphY - point.y);
         if (dx <= renderer.nodeWidth / 2 && dy <= renderer.nodeHeight / 2) {
           return id;
+        }
+      }
+      return null;
+    }
+
+    function hitCanvasFileCluster(clientX, clientY) {
+      const renderer = state.canvasRenderer;
+      if (!renderer?.fileClusters?.length) {
+        return null;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const graphX = (clientX - rect.left - view.offsetX) / view.scale;
+      const graphY = (clientY - rect.top - view.offsetY) / view.scale;
+      for (const cluster of renderer.fileClusters) {
+        if (!state.activeFiles.has(cluster.file)) {
+          continue;
+        }
+        if (
+          graphX >= cluster.x
+          && graphX <= cluster.x + cluster.width
+          && graphY >= cluster.y
+          && graphY <= cluster.y + cluster.height
+        ) {
+          return cluster.file;
         }
       }
       return null;
@@ -1494,6 +1916,29 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       (state.incoming.get(state.selectedNode) || []).forEach((call) => ids.add(call.caller));
       (state.outgoing.get(state.selectedNode) || []).forEach((call) => ids.add(call.callee));
       return ids;
+    }
+
+    function hoverNeighborhood() {
+      const id = state.hoverNode;
+      if (!id) {
+        return null;
+      }
+      const ids = new Set([id]);
+      (state.incoming.get(id) || []).forEach((call) => ids.add(call.caller));
+      (state.outgoing.get(id) || []).forEach((call) => ids.add(call.callee));
+      return ids;
+    }
+
+    function setHoverNode(id) {
+      if (state.hoverNode === id) {
+        return;
+      }
+      state.hoverNode = id;
+      if (state.canvasRenderer) {
+        scheduleCanvasDraw();
+      } else {
+        applyGraphState();
+      }
     }
 
     function nodeMatchesQuery(id, query) {
@@ -1583,46 +2028,66 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     function applyGraphState() {
       const query = filter.value.trim().toLowerCase();
+      const isolated = neighborhood();
+      const hovered = hoverNeighborhood();
       updateSearchMatches(query);
+      traceDepthInput.value = String(state.traceDepth);
+      traceDepthValue.textContent = String(state.traceDepth);
+      traceEntryButton.classList.toggle("active", state.preset === "trace" && state.traceRoot === state.entrypointNode);
+      traceSelectedButton.classList.toggle("active", state.preset === "trace" && state.selectedNode === state.traceRoot);
       if (state.canvasRenderer) {
         isolateButton.classList.toggle("active", state.isolate);
         hideIsolatedButton.classList.toggle("active", state.hideIsolated);
         layoutPreset.value = state.preset;
         renderFileFilters();
-        drawCanvasGraph();
+        scheduleCanvasDraw();
         drawCanvasMinimap();
         updateMinimap();
         return;
       }
 
-      const isolated = neighborhood();
-
       document.querySelectorAll("#canvas .node").forEach((node) => {
         const id = node.dataset.id || node.querySelector?.("title")?.textContent;
-        const visible = nodeBaseVisible(id);
+        const visible = isolated ? nodeBaseVisible(id) : nodeDisplayVisible(id);
+        const trace = state.preset === "trace" && traceGraph().nodes.has(id);
+        const path = nodeInPath(id);
         const dim = visible && (
-          !passesPreset(id)
-          || !nodeMatchesQuery(id, query)
+          !nodeMatchesQuery(id, query)
           || (isolated && !isolated.has(id))
+          || (hovered && !hovered.has(id))
+          || (state.pathNodes.size && !path)
         );
         node.classList.toggle("filtered-out", !visible);
         node.classList.toggle("dimmed", Boolean(dim));
         node.classList.toggle("selected", id === state.selectedNode);
+        node.classList.toggle("trace", trace);
+        node.classList.toggle("path", path);
+        node.classList.toggle("hovered", id === state.hoverNode);
       });
 
       document.querySelectorAll("#canvas .edge").forEach((edge) => {
         const key = edge.dataset.edge || edge.querySelector?.("title")?.textContent;
         const { caller, callee } = splitEdgeKey(key);
         const call = firstEdgeCall(key);
-        const visible = edgeBaseVisible(call, caller, callee);
+        const visible = Boolean(
+          call
+          && edgeBaseVisible(call, caller, callee)
+          && (isolated || !edgeTouchesCollapsedFile(call))
+          && (isolated || edgeInActiveTrace(call))
+        );
+        const trace = call && state.preset === "trace" && traceGraph().edges.has(key);
+        const path = edgeInPath(key);
         const dim = visible && (
-          !edgePassesPreset(call, caller, callee)
-          || !edgeMatchesQuery(call, caller, callee, query)
+          !edgeMatchesQuery(call, caller, callee, query)
           || (isolated && !(isolated.has(caller) && isolated.has(callee)))
+          || (hovered && !(hovered.has(caller) && hovered.has(callee)))
+          || (state.pathEdges.size && !path)
         );
         edge.classList.toggle("filtered-out", !visible);
         edge.classList.toggle("dimmed", Boolean(dim));
         edge.classList.toggle("selected", key === state.selectedEdge);
+        edge.classList.toggle("trace", Boolean(trace));
+        edge.classList.toggle("path", path);
       });
 
       isolateButton.classList.toggle("active", state.isolate);
@@ -1651,6 +2116,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }
 
       event.preventDefault();
+      view.lastWheelAt = performance.now();
+      clearTimeout(view.wheelSettleTimer);
+      view.wheelSettleTimer = setTimeout(scheduleCanvasDraw, 220);
       const rect = canvas.getBoundingClientRect();
       const pointerX = event.clientX - rect.left;
       const pointerY = event.clientY - rect.top;
@@ -1694,6 +2162,20 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       applyViewTransform();
     });
 
+    canvas.addEventListener("pointermove", (event) => {
+      if (view.isPanning || view.isMiniPanning || !viewport()) {
+        return;
+      }
+      if (state.canvasRenderer && event.target.closest?.("#graph-canvas")) {
+        setHoverNode(hitCanvasNode(event.clientX, event.clientY));
+        return;
+      }
+      const node = event.target.closest?.(".node");
+      const id = node?.dataset?.id || node?.querySelector?.("title")?.textContent || null;
+      setHoverNode(id && state.functions.has(id) ? id : null);
+    });
+    canvas.addEventListener("pointerleave", () => setHoverNode(null));
+
     function stopPanning(event) {
       if (!view.isPanning) {
         return;
@@ -1706,6 +2188,8 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }
       if (!view.moved) {
         selectFromPoint(event.clientX, event.clientY, view.startTarget);
+      } else {
+        scheduleCanvasDraw();
       }
     }
 
@@ -1759,6 +2243,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     searchNextButton.addEventListener("click", () => focusSearchMatch(1));
     resetButton.addEventListener("click", () => {
       state.isolate = false;
+      clearPath();
       resetView();
       applyGraphState();
     });
@@ -1770,9 +2255,48 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       state.hideIsolated = !state.hideIsolated;
       applyGraphState();
     });
+    traceEntryButton.addEventListener("click", () => {
+      state.isolate = false;
+      setTraceRoot(state.entrypointNode || defaultEntrypointId());
+      centerNode(state.traceRoot);
+    });
+    traceSelectedButton.addEventListener("click", () => {
+      state.isolate = false;
+      setTraceRoot(state.selectedNode || state.entrypointNode || defaultEntrypointId());
+      centerNode(state.traceRoot);
+    });
+    traceDepthInput.addEventListener("input", () => {
+      state.traceDepth = Number(traceDepthInput.value) || 3;
+      traceDepthValue.textContent = String(state.traceDepth);
+      invalidateTrace();
+      applyGraphState();
+    });
+    findPathButton.addEventListener("click", () => {
+      const from = findFunctionByQuery(pathFromInput.value) || (state.selectedNode ? state.functions.get(state.selectedNode) : null);
+      const to = findFunctionByQuery(pathToInput.value);
+      if (!from || !to) {
+        inspector.innerHTML = '<h2>Path finder</h2><p class="muted">Set a valid source and target function.</p>';
+        return;
+      }
+      state.isolate = false;
+      state.preset = "all";
+      setPath(from.id, to.id);
+    });
+    clearPathButton.addEventListener("click", () => clearPath());
+    collapseClustersButton.addEventListener("click", () => {
+      state.collapsedFiles = new Set([...state.activeFiles]);
+      renderFileFilters();
+      applyGraphState();
+    });
+    expandClustersButton.addEventListener("click", () => {
+      state.collapsedFiles.clear();
+      renderFileFilters();
+      applyGraphState();
+    });
     layoutPreset.addEventListener("change", () => {
       state.preset = layoutPreset.value;
       state.selectedGroup = null;
+      invalidateTrace();
       applyGraphState();
     });
     fileFilters.addEventListener("click", (event) => {
@@ -1786,15 +2310,63 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       } else if (item.dataset.fileAction === "none") {
         state.activeFiles = new Set();
       } else if (item.dataset.file) {
+        if (event.altKey || event.shiftKey) {
+          if (state.collapsedFiles.has(item.dataset.file)) {
+            state.collapsedFiles.delete(item.dataset.file);
+          } else {
+            state.collapsedFiles.add(item.dataset.file);
+          }
+          renderFileFilters();
+          applyGraphState();
+          return;
+        }
         if (state.activeFiles.has(item.dataset.file)) {
           state.activeFiles.delete(item.dataset.file);
         } else {
           state.activeFiles.add(item.dataset.file);
         }
       }
+      invalidateTrace();
       applyGraphState();
     });
     inspector.addEventListener("click", (event) => {
+      const traceNode = event.target.closest("[data-trace-node]");
+      if (traceNode) {
+        setTraceRoot(traceNode.dataset.traceNode);
+        centerNode(traceNode.dataset.traceNode);
+        return;
+      }
+
+      const pathFrom = event.target.closest("[data-path-from]");
+      if (pathFrom) {
+        const item = state.functions.get(pathFrom.dataset.pathFrom);
+        pathFromInput.value = item?.name || pathFrom.dataset.pathFrom;
+        state.pathFrom = pathFrom.dataset.pathFrom;
+        return;
+      }
+
+      const pathTo = event.target.closest("[data-path-to]");
+      if (pathTo) {
+        const item = state.functions.get(pathTo.dataset.pathTo);
+        pathToInput.value = item?.name || pathTo.dataset.pathTo;
+        const from = state.pathFrom || findFunctionByQuery(pathFromInput.value)?.id || state.selectedNode;
+        setPath(from, pathTo.dataset.pathTo);
+        return;
+      }
+
+      const collapseFile = event.target.closest("[data-collapse-file]");
+      if (collapseFile) {
+        const file = collapseFile.dataset.collapseFile;
+        if (state.collapsedFiles.has(file)) {
+          state.collapsedFiles.delete(file);
+        } else {
+          state.collapsedFiles.add(file);
+        }
+        renderFileFilters();
+        applyGraphState();
+        return;
+      }
+
       const sourceMode = event.target.closest("[data-source-mode]");
       if (sourceMode) {
         state.sourceMode = sourceMode.dataset.sourceMode;
@@ -1927,7 +2499,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         flowColumns: layout.columns,
         nodeWidth: layout.nodeWidth,
         nodeHeight: layout.nodeHeight,
-        edgeBudget: data.calls.length > 50000 ? 25000 : data.calls.length,
+        edgeBudget: data.calls.length > 8000 ? 3500 : data.calls.length,
         groupCache: new Map()
       };
 
@@ -2754,6 +3326,9 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       }
 
       const isolated = neighborhood();
+      const hovered = hoverNeighborhood();
+      const trace = activeTraceGraph();
+      const hasPath = state.pathNodes.size > 0;
       context.save();
       for (const cluster of clusters) {
         if (isolated && !cluster.functionIds.some((id) => isolated.has(id))) {
@@ -2762,33 +3337,45 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         if (!cluster.functionIds.some((id) => nodeBaseVisible(id))) {
           continue;
         }
+        if (!isolated && trace && !cluster.functionIds.some((id) => trace.nodes.has(id))) {
+          continue;
+        }
         if (!visibleCanvasRect(cluster, width, height)) {
           continue;
         }
 
+        const collapsed = fileCollapsed(cluster.file);
+        const selected = state.selectedNode && cluster.functionIds.includes(state.selectedNode);
+        const highlighted = collapsed
+          || selected
+          || cluster.functionIds.some((id) => nodeInPath(id) || id === state.hoverNode);
+        const dimmed = (hasPath && !cluster.functionIds.some((id) => nodeInPath(id)))
+          || (hovered && !cluster.functionIds.some((id) => hovered.has(id)));
         const x = cluster.x * view.scale + view.offsetX;
         const y = cluster.y * view.scale + view.offsetY;
         const clusterWidth = cluster.width * view.scale;
         const clusterHeight = cluster.height * view.scale;
         const radius = 4 * view.scale;
 
-        context.globalAlpha = 0.5;
+        context.globalAlpha = highlighted ? 0.68 : dimmed ? 0.18 : 0.46;
         context.fillStyle = fileColor(cluster.file);
         roundedRect(context, x, y, clusterWidth, clusterHeight, radius);
         context.fill();
 
-        context.globalAlpha = 0.82;
-        context.strokeStyle = "#333333";
-        context.lineWidth = Math.max(0.8, 1.1 * view.scale);
+        context.globalAlpha = highlighted ? 0.96 : dimmed ? 0.28 : 0.82;
+        context.strokeStyle = selected ? "#d12f1f" : collapsed ? "#934f12" : "#333333";
+        context.lineWidth = highlighted ? Math.max(1.4, 2.2 * view.scale) : Math.max(0.8, 1.1 * view.scale);
         context.stroke();
 
         if (view.scale >= 0.26) {
-          context.globalAlpha = 0.94;
+          context.globalAlpha = dimmed ? 0.34 : 0.94;
           context.fillStyle = "#10131a";
           context.textAlign = "center";
           context.textBaseline = "middle";
           context.font = `700 ${Math.max(8, 12 * view.scale)}px Helvetica, Arial, sans-serif`;
-          const label = cluster.label.length > 42 ? `${cluster.label.slice(0, 41)}...` : cluster.label;
+          const suffix = collapsed ? " (collapsed)" : "";
+          const labelText = `${cluster.label}${suffix}`;
+          const label = labelText.length > 42 ? `${labelText.slice(0, 41)}...` : labelText;
           context.fillText(label, x + clusterWidth / 2, y + 16 * view.scale, clusterWidth - 24 * view.scale);
           if (view.scale >= 0.42) {
             context.fillStyle = "#536070";
@@ -2805,13 +3392,18 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       context.restore();
     }
 
-    function drawCanvasFileEdges(context, width, height, renderer) {
+    function drawCanvasFileEdges(context, width, height, renderer, collapsedOnly = false) {
       const clustersByFile = new Map((renderer.fileClusters || []).map((cluster) => [cluster.file, cluster]));
       const query = filter.value.trim().toLowerCase();
+      const hovered = hoverNeighborhood();
+      const hasPath = state.pathNodes.size > 0;
 
       context.save();
       context.lineCap = "round";
       for (const edge of renderer.fileEdges || []) {
+        if (collapsedOnly && !fileCollapsed(edge.caller) && !fileCollapsed(edge.callee)) {
+          continue;
+        }
         const caller = clustersByFile.get(edge.caller);
         const callee = clustersByFile.get(edge.callee);
         if (!caller || !callee) {
@@ -2842,9 +3434,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
 
-        context.globalAlpha = dim ? 0.08 : 0.32;
+        const highlighted = collapsedOnly || caller.functionIds.some((id) => nodeInPath(id)) || callee.functionIds.some((id) => nodeInPath(id));
+        const hoverDim = hovered && !caller.functionIds.some((id) => hovered.has(id)) && !callee.functionIds.some((id) => hovered.has(id));
+        context.globalAlpha = highlighted ? 0.58 : dim || hoverDim || (hasPath && !highlighted) ? 0.08 : 0.32;
         context.strokeStyle = canvasCallColor(edge.kind);
-        context.lineWidth = Math.max(0.8, Math.min(7, Math.log2(edge.count + 1)) * Math.max(0.45, view.scale));
+        context.lineWidth = Math.max(
+          highlighted ? 1.4 : 0.8,
+          Math.min(8, Math.log2(edge.count + 1)) * Math.max(highlighted ? 0.7 : 0.45, view.scale)
+        );
         context.setLineDash(edge.kind === "method" ? [6, 4] : edge.kind === "unknown" ? [2, 4] : []);
         strokeScreenCurve(context, curve);
       }
@@ -2884,6 +3481,54 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       context.restore();
     }
 
+    function drawCanvasHighlightedCalls(context, width, height, renderer, traceOnly = false) {
+      const query = filter.value.trim().toLowerCase();
+      const hovered = hoverNeighborhood();
+      const trace = activeTraceGraph();
+      let drawn = 0;
+
+      context.save();
+      context.lineCap = "round";
+      for (const call of state.graph.calls) {
+        const key = edgeKey(call);
+        const traceEdge = Boolean(trace?.edges.has(key));
+        const path = edgeInPath(key);
+        const selected = key === state.selectedEdge;
+        const endpointSelected = call.caller === state.selectedNode || call.callee === state.selectedNode;
+        const hoverEdge = Boolean(hovered && hovered.has(call.caller) && hovered.has(call.callee));
+        if (traceOnly && !traceEdge) {
+          continue;
+        }
+        if (!traceOnly && !path && !selected && !endpointSelected && !hoverEdge) {
+          continue;
+        }
+        if (!callDisplayVisible(call)) {
+          continue;
+        }
+
+        const caller = renderer.positions.get(call.caller);
+        const callee = renderer.positions.get(call.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        const curve = canvasCallCurve(caller, callee);
+        if (!visibleScreenCurve(curve, width, height, 360)) {
+          continue;
+        }
+
+        const dim = !edgeMatchesQuery(call, call.caller, call.callee, query);
+        const strong = selected || path;
+        context.globalAlpha = strong ? 0.94 : dim ? 0.18 : traceEdge ? 0.58 : 0.5;
+        context.strokeStyle = strong ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.lineWidth = strong ? Math.max(1.8, view.scale * 3) : Math.max(1.1, view.scale * 1.9);
+        context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
+        strokeScreenCurve(context, curve);
+        drawn += 1;
+      }
+      context.restore();
+      return drawn;
+    }
+
     function selectedNeighborhoodCalls() {
       if (!state.isolate || !state.selectedNode) {
         return [];
@@ -2897,6 +3542,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     function drawCanvasNodeDots(context, width, height, renderer) {
       const query = filter.value.trim().toLowerCase();
       const isolated = neighborhood();
+      const hovered = hoverNeighborhood();
       const dotSize = view.scale < 0.22 ? 2 : 3;
 
       context.save();
@@ -2904,19 +3550,25 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         if (isolated && !isolated.has(id)) {
           continue;
         }
-        if (!nodeBaseVisible(id) || !visibleCanvasPoint(point, width, height, 80)) {
+        const visible = isolated ? nodeBaseVisible(id) : nodeDisplayVisible(id);
+        if (!visible || !visibleCanvasPoint(point, width, height, 80)) {
           continue;
         }
-        const dim = !passesPreset(id)
-          || !nodeMatchesQuery(id, query)
-          || (isolated && !isolated.has(id));
+        const path = nodeInPath(id);
+        const traceRoot = state.preset === "trace" && id === state.traceRoot;
+        const hoveredNode = id === state.hoverNode;
+        const dim = !nodeMatchesQuery(id, query)
+          || (isolated && !isolated.has(id))
+          || (hovered && !hovered.has(id))
+          || (state.pathNodes.size && !path);
         const x = point.x * view.scale + view.offsetX;
         const y = point.y * view.scale + view.offsetY;
         const selected = id === state.selectedNode;
+        const size = selected || path || hoveredNode || traceRoot ? dotSize + 2 : dotSize;
 
         context.globalAlpha = selected ? 1 : dim ? 0.12 : 0.72;
-        context.fillStyle = selected ? "#d12f1f" : "#10131a";
-        context.fillRect(x - dotSize / 2, y - dotSize / 2, dotSize, dotSize);
+        context.fillStyle = selected || path ? "#d12f1f" : traceRoot ? "#934f12" : hoveredNode ? "#10131a" : "#1d6f8f";
+        context.fillRect(x - size / 2, y - size / 2, size, size);
       }
       context.restore();
     }
@@ -2927,6 +3579,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     function drawCanvasFunctionNodes(context, width, height, renderer, isolated) {
       const query = filter.value.trim().toLowerCase();
+      const hovered = hoverNeighborhood();
       for (const [id, point] of renderer.positions) {
         if (isolated && !isolated.has(id)) {
           continue;
@@ -2934,23 +3587,28 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         if (!visibleCanvasPoint(point, width, height)) {
           continue;
         }
-        if (!nodeBaseVisible(id)) {
+        const visible = isolated ? nodeBaseVisible(id) : nodeDisplayVisible(id);
+        if (!visible) {
           continue;
         }
 
         const item = state.functions.get(id);
-        const dim = !passesPreset(id)
-          || !nodeMatchesQuery(id, query)
-          || (isolated && !isolated.has(id));
+        const path = nodeInPath(id);
+        const traceRoot = state.preset === "trace" && id === state.traceRoot;
+        const hoveredNode = id === state.hoverNode;
+        const dim = !nodeMatchesQuery(id, query)
+          || (isolated && !isolated.has(id))
+          || (hovered && !hovered.has(id))
+          || (state.pathNodes.size && !path);
         const x = point.x * view.scale + view.offsetX;
         const y = point.y * view.scale + view.offsetY;
         const nodeWidth = renderer.nodeWidth * view.scale;
         const nodeHeight = renderer.nodeHeight * view.scale;
 
         context.globalAlpha = dim ? 0.16 : 1;
-        context.fillStyle = "#b9e1ea";
-        context.strokeStyle = id === state.selectedNode ? "#d12f1f" : "#111111";
-        context.lineWidth = id === state.selectedNode ? Math.max(2, view.scale * 3) : Math.max(1, view.scale * 1.4);
+        context.fillStyle = traceRoot ? "#fff8d4" : "#b9e1ea";
+        context.strokeStyle = id === state.selectedNode || path || hoveredNode ? "#d12f1f" : "#111111";
+        context.lineWidth = id === state.selectedNode || path || hoveredNode ? Math.max(2, view.scale * 3) : Math.max(1, view.scale * 1.4);
         context.beginPath();
         context.ellipse(x, y, nodeWidth / 2, nodeHeight / 2, 0, 0, Math.PI * 2);
         context.fill();
@@ -2971,6 +3629,30 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           }
         }
       }
+    }
+
+    function drawCanvasNodesByLod(context, width, height, renderer, isolated = null) {
+      if (canvasInteractionActive() || view.scale < 0.62) {
+        drawCanvasNodeDots(context, width, height, renderer);
+        return;
+      }
+      drawCanvasFunctionNodes(context, width, height, renderer, isolated);
+    }
+
+    function shouldDrawFullCanvasEdges(query) {
+      if (canvasInteractionActive()) {
+        return false;
+      }
+      if (state.preset !== "all" && state.preset !== "fan-in" && state.preset !== "fan-out" && state.preset !== "cycles") {
+        return false;
+      }
+      if (!query && state.graph.calls.length > 6000) {
+        return false;
+      }
+      if (state.graph.calls.length > 6000 && view.scale < 1.2) {
+        return false;
+      }
+      return true;
     }
 
     function drawCanvasGraph() {
@@ -2995,8 +3677,13 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       if (view.scale < 0.38) {
         if (state.isolate && state.selectedNode) {
           drawCanvasIsolatedCalls(context, width, height, renderer);
+        } else if (state.preset === "trace") {
+          drawCanvasHighlightedCalls(context, width, height, renderer, true);
         } else {
           drawCanvasFileEdges(context, width, height, renderer);
+          if (hasFocusedCanvasCalls()) {
+            drawCanvasHighlightedCalls(context, width, height, renderer, false);
+          }
         }
         drawCanvasNodeDots(context, width, height, renderer);
         context.globalAlpha = 1;
@@ -3005,9 +3692,33 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
       const query = filter.value.trim().toLowerCase();
       const isolated = neighborhood();
+      const hovered = hoverNeighborhood();
       if (isolated) {
         drawCanvasIsolatedCalls(context, width, height, renderer);
-        drawCanvasFunctionNodes(context, width, height, renderer, isolated);
+        drawCanvasNodesByLod(context, width, height, renderer, isolated);
+        context.globalAlpha = 1;
+        return;
+      }
+
+      if (state.preset === "trace") {
+        drawCanvasHighlightedCalls(context, width, height, renderer, true);
+        drawCanvasNodesByLod(context, width, height, renderer);
+        context.globalAlpha = 1;
+        return;
+      }
+
+      if (state.collapsedFiles.size) {
+        drawCanvasFileEdges(context, width, height, renderer, true);
+      }
+
+      if (!shouldDrawFullCanvasEdges(query)) {
+        if (!state.collapsedFiles.size) {
+          drawCanvasFileEdges(context, width, height, renderer);
+        }
+        if (hasFocusedCanvasCalls()) {
+          drawCanvasHighlightedCalls(context, width, height, renderer, false);
+        }
+        drawCanvasNodesByLod(context, width, height, renderer);
         context.globalAlpha = 1;
         return;
       }
@@ -3016,7 +3727,17 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       context.lineCap = "round";
 
       for (const call of state.graph.calls) {
-        if (drawnEdges >= renderer.edgeBudget && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+        const key = edgeKey(call);
+        const selected = key === state.selectedEdge;
+        const path = edgeInPath(key);
+        const traceEdge = state.preset === "trace" && traceGraph().edges.has(key);
+        const endpointSelected = call.caller === state.selectedNode || call.callee === state.selectedNode;
+        const hoverEdge = Boolean(hovered && hovered.has(call.caller) && hovered.has(call.callee));
+        const important = selected || path || traceEdge || endpointSelected || hoverEdge;
+        if (state.pathEdges.size && !path && !selected) {
+          continue;
+        }
+        if (drawnEdges >= renderer.edgeBudget && !important) {
           continue;
         }
 
@@ -3029,26 +3750,25 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         if (!visibleScreenCurve(curve, width, height, 320)) {
           continue;
         }
-        if (!edgeBaseVisible(call, call.caller, call.callee)) {
+        if (!callDisplayVisible(call)) {
           continue;
         }
 
-        const dim = !edgePassesPreset(call, call.caller, call.callee)
-          || !edgeMatchesQuery(call, call.caller, call.callee, query);
-        if (dim && view.scale < 0.45 && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+        const dim = !edgeMatchesQuery(call, call.caller, call.callee, query)
+          || (hovered && !hoverEdge);
+        if (dim && view.scale < 0.45 && !important) {
           continue;
         }
 
-        const selected = edgeKey(call) === state.selectedEdge;
-        context.globalAlpha = selected ? 0.9 : dim ? 0.1 : 0.34;
-        context.strokeStyle = canvasCallColor(callKind(call));
-        context.lineWidth = selected ? Math.max(1.4, view.scale * 2.4) : Math.max(0.65, view.scale * 1.05);
+        context.globalAlpha = selected || path ? 0.92 : dim ? 0.08 : traceEdge ? 0.48 : important ? 0.44 : 0.28;
+        context.strokeStyle = selected || path ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.lineWidth = selected || path ? Math.max(1.8, view.scale * 3) : important ? Math.max(1, view.scale * 1.6) : Math.max(0.65, view.scale * 1.05);
         context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
         strokeScreenCurve(context, curve);
         drawnEdges += 1;
       }
       context.setLineDash([]);
-      drawCanvasFunctionNodes(context, width, height, renderer, null);
+      drawCanvasNodesByLod(context, width, height, renderer);
 
       context.globalAlpha = 1;
     }
@@ -3177,13 +3897,31 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const scale = Math.min(width / graph.bounds.width, height / graph.bounds.height);
       const left = (width - graph.bounds.width * scale) / 2;
       const top = (height - graph.bounds.height * scale) / 2;
+      if (!activeGroupMode() && renderer.fileClusters?.length && (state.collapsedFiles.size || state.preset === "trace")) {
+        const trace = activeTraceGraph();
+        context.fillStyle = "rgba(147, 79, 18, 0.18)";
+        for (const cluster of renderer.fileClusters) {
+          if (!state.activeFiles.has(cluster.file)) {
+            continue;
+          }
+          if (trace && !cluster.functionIds.some((id) => trace.nodes.has(id))) {
+            continue;
+          }
+          context.fillRect(
+            left + cluster.x * scale,
+            top + cluster.y * scale,
+            Math.max(1, cluster.width * scale),
+            Math.max(1, cluster.height * scale)
+          );
+        }
+      }
       context.fillStyle = "rgba(29, 111, 143, 0.32)";
       for (const [id, point] of graph.positions) {
         if (activeGroupMode()) {
           if (!groupVisible(graph.groups.get(id))) {
             continue;
           }
-        } else if (!nodeBaseVisible(id)) {
+        } else if (!nodeDisplayVisible(id)) {
           continue;
         }
         context.fillRect(left + point.x * scale, top + point.y * scale, activeGroupMode() ? 3 : 1.5, activeGroupMode() ? 3 : 1.5);
@@ -3380,5 +4118,14 @@ mod tests {
         assert!(html.contains("drawCanvasIsolatedCalls"));
         assert!(html.contains("selectedNeighborhoodCalls"));
         assert!(html.contains("drawCanvasFunctionNodes"));
+        assert!(html.contains("<option value=\"all\">All calls</option>"));
+        assert!(html.contains("trace-entry"));
+        assert!(html.contains("find-path"));
+        assert!(html.contains("collapse-clusters"));
+        assert!(html.contains("traceGraph"));
+        assert!(html.contains("findShortestPath"));
+        assert!(html.contains("drawCanvasHighlightedCalls"));
+        assert!(html.contains("nodeDisplayVisible"));
+        assert!(html.contains("scheduleCanvasDraw"));
     }
 }
