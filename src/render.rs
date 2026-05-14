@@ -755,8 +755,8 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         </div>
         <div class="toolbar-group">
           <select id="layout-preset" aria-label="Layout preset">
-            <option value="by-folder">By folder flow</option>
             <option value="all">All calls</option>
+            <option value="by-folder">By folder flow</option>
             <option value="by-file">By file flow</option>
             <option value="fan-in">Fan-in only</option>
             <option value="fan-out">Fan-out only</option>
@@ -1917,17 +1917,17 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function fallbackDrawCanvas(data) {
-      const layout = canvasLayout(data.functions);
-      if (state.preset === "all" && shouldUseCanvasRenderer(data)) {
-        state.preset = "by-folder";
-      }
+      const layout = canvasLayout(data.functions, data.calls);
       state.canvasRenderer = {
         canvas: null,
         positions: layout.positions,
         bounds: layout.bounds,
-        nodeWidth: 170,
-        nodeHeight: 48,
-        edgeBudget: data.calls.length > 12000 ? 9000 : 14000,
+        fileClusters: layout.fileClusters,
+        fileEdges: layout.fileEdges,
+        flowColumns: layout.columns,
+        nodeWidth: layout.nodeWidth,
+        nodeHeight: layout.nodeHeight,
+        edgeBudget: data.calls.length > 50000 ? 25000 : data.calls.length,
         groupCache: new Map()
       };
 
@@ -1949,31 +1949,545 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       applyGraphState();
     }
 
-    function canvasLayout(nodes) {
-      const sorted = [...nodes].sort((left, right) =>
-        left.file.localeCompare(right.file)
-        || left.name.localeCompare(right.name)
-        || left.line - right.line
-      );
-      const columns = Math.max(8, Math.ceil(Math.sqrt(sorted.length * 1.8)));
-      const cellWidth = 210;
-      const cellHeight = 78;
+    function canvasLayout(nodes, calls) {
+      const sorted = [...nodes].sort(compareFunctions);
       const positions = new Map();
+      const nodeWidth = 170;
+      const nodeHeight = 48;
+      if (!sorted.length) {
+        return { positions, bounds: { width: 980, height: 680 }, columns: [], fileClusters: [], fileEdges: [], nodeWidth, nodeHeight };
+      }
 
-      sorted.forEach((node, index) => {
-        positions.set(node.id, {
-          x: 90 + (index % columns) * cellWidth,
-          y: 70 + Math.floor(index / columns) * cellHeight
-        });
-      });
+      const graphCalls = calls.filter((call) => state.functions.has(call.caller) && state.functions.has(call.callee));
+      const fileLayouts = buildFileLayouts(sorted, graphCalls, nodeWidth, nodeHeight);
+      const fileDepths = fileFlowDepths(fileLayouts, graphCalls);
+      const filesByDepth = new Map();
+
+      for (const file of fileLayouts) {
+        file.depth = fileDepths.get(file.file) || 0;
+        if (!filesByDepth.has(file.depth)) {
+          filesByDepth.set(file.depth, []);
+        }
+        filesByDepth.get(file.depth).push(file);
+      }
+
+      const depthEntries = [...filesByDepth.entries()].sort((left, right) => left[0] - right[0]);
+      const depthGap = 96;
+      const laneGap = 36;
+      const rowGap = 46;
+      const leftPad = 48;
+      const topPad = 48;
+      const targetHeight = layoutTargetHeight(fileLayouts, topPad);
+      let xCursor = leftPad;
+      let boundsWidth = 980;
+      let boundsHeight = 680;
+      const columns = [];
+
+      for (const [depth, files] of depthEntries) {
+        files.sort(compareFileLayouts);
+        const lanes = packFileLanes(files, targetHeight, rowGap);
+        const depthWidth = lanes.reduce((total, lane) => total + lane.width, 0) + Math.max(0, lanes.length - 1) * laneGap;
+        const functionCount = files.reduce((total, file) => total + file.nodes.length, 0);
+        columns.push({ index: depth, x: xCursor + depthWidth / 2, width: depthWidth, count: functionCount });
+
+        let laneX = xCursor;
+        for (const lane of lanes) {
+          let yCursor = topPad;
+          for (const file of lane.files) {
+            file.x = laneX;
+            file.y = yCursor;
+            placeFileNodes(file, positions, nodeWidth, nodeHeight);
+            yCursor += file.height + rowGap;
+            boundsWidth = Math.max(boundsWidth, file.x + file.width + leftPad);
+            boundsHeight = Math.max(boundsHeight, file.y + file.height + topPad);
+          }
+          laneX += lane.width + laneGap;
+        }
+
+        xCursor += depthWidth + depthGap;
+      }
 
       return {
         positions,
+        columns,
+        fileClusters: fileLayouts.map((file) => ({
+          file: file.file,
+          label: file.label,
+          x: file.x,
+          y: file.y,
+          width: file.width,
+          height: file.height,
+          functionIds: file.nodes.map((node) => node.id),
+          functionCount: file.nodes.length,
+          internalCalls: file.internalCalls,
+          incomingCalls: file.incomingCalls,
+          outgoingCalls: file.outgoingCalls
+        })),
+        fileEdges: aggregateFileEdges(graphCalls),
+        nodeWidth,
+        nodeHeight,
         bounds: {
-          width: columns * cellWidth + 180,
-          height: Math.ceil(sorted.length / columns) * cellHeight + 140
+          width: boundsWidth,
+          height: boundsHeight
         }
       };
+    }
+
+    function layoutTargetHeight(fileLayouts, topPad) {
+      const area = fileLayouts.reduce((total, file) => total + file.width * file.height, 0);
+      const viewportAspect = canvas.clientWidth && canvas.clientHeight
+        ? canvas.clientWidth / canvas.clientHeight
+        : 1.75;
+      const targetAspect = clamp(viewportAspect, 1.45, 2.35);
+      const tallestFile = Math.max(0, ...fileLayouts.map((file) => file.height));
+      return Math.max(680, tallestFile + topPad * 2, Math.sqrt(area / targetAspect) * 1.15);
+    }
+
+    function packFileLanes(files, targetHeight, rowGap) {
+      const lanes = [];
+      for (const file of files) {
+        let bestLane = null;
+        for (const lane of lanes) {
+          const nextHeight = lane.height + (lane.files.length ? rowGap : 0) + file.height;
+          if (nextHeight <= targetHeight && (!bestLane || lane.height < bestLane.height)) {
+            bestLane = lane;
+          }
+        }
+
+        if (!bestLane) {
+          bestLane = { files: [], width: 0, height: 0 };
+          lanes.push(bestLane);
+        }
+
+        bestLane.height += (bestLane.files.length ? rowGap : 0) + file.height;
+        bestLane.width = Math.max(bestLane.width, file.width);
+        bestLane.files.push(file);
+      }
+      return lanes;
+    }
+
+    function placeFileNodes(file, positions, nodeWidth, nodeHeight) {
+      file.layers.forEach(([_, layer], columnIndex) => {
+        layer.forEach((node, row) => {
+          positions.set(node.id, {
+            x: file.x + file.paddingX + nodeWidth / 2 + columnIndex * file.cellWidth,
+            y: file.y + file.headerHeight + nodeHeight / 2 + row * file.cellHeight
+          });
+        });
+      });
+    }
+
+    function buildFileLayouts(nodes, calls, nodeWidth, nodeHeight) {
+      const files = new Map();
+      for (const node of nodes) {
+        if (!files.has(node.file)) {
+          files.set(node.file, {
+            file: node.file,
+            label: fileLabel(node.file),
+            nodes: [],
+            internalCalls: 0,
+            incomingCalls: 0,
+            outgoingCalls: 0
+          });
+        }
+        files.get(node.file).nodes.push(node);
+      }
+
+      for (const call of calls) {
+        const caller = state.functions.get(call.caller);
+        const callee = state.functions.get(call.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        if (caller.file === callee.file) {
+          files.get(caller.file).internalCalls += 1;
+        } else {
+          files.get(caller.file).outgoingCalls += 1;
+          files.get(callee.file).incomingCalls += 1;
+        }
+      }
+
+      const cellWidth = 218;
+      const cellHeight = 72;
+      const paddingX = 30;
+      const headerHeight = 58;
+
+      for (const file of files.values()) {
+        file.entryRank = Math.min(...file.nodes.map(entrypointRankForFunction));
+        file.nodes.sort(compareFunctions);
+        const maxLocalColumns = Math.max(2, Math.min(9, Math.ceil(Math.sqrt(file.nodes.length * 0.85))));
+        const depths = nodeDepthsForSubset(file.nodes, calls, maxLocalColumns);
+        const layers = new Map();
+        for (const node of file.nodes) {
+          const layer = depths.get(node.id) || 0;
+          if (!layers.has(layer)) {
+            layers.set(layer, []);
+          }
+          layers.get(layer).push(node);
+        }
+        file.layers = [...layers.entries()].sort((left, right) => left[0] - right[0]);
+        orderLayersByNeighborhood(file.layers, calls);
+        const maxRows = Math.max(1, ...file.layers.map(([, layer]) => layer.length));
+        file.cellWidth = cellWidth;
+        file.cellHeight = cellHeight;
+        file.paddingX = paddingX;
+        file.headerHeight = headerHeight;
+        file.width = Math.max(330, (file.layers.length - 1) * cellWidth + nodeWidth + paddingX * 2);
+        file.height = Math.max(148, headerHeight + maxRows * cellHeight + 30);
+        file.weight = file.nodes.length + file.internalCalls + file.incomingCalls + file.outgoingCalls;
+      }
+
+      return [...files.values()].sort(compareFileLayouts);
+    }
+
+    function aggregateFileEdges(calls) {
+      const edges = new Map();
+      for (const call of calls) {
+        const callerFile = state.functions.get(call.caller)?.file;
+        const calleeFile = state.functions.get(call.callee)?.file;
+        if (!callerFile || !calleeFile || callerFile === calleeFile) {
+          continue;
+        }
+        const key = `${callerFile}->${calleeFile}`;
+        if (!edges.has(key)) {
+          edges.set(key, {
+            caller: callerFile,
+            callee: calleeFile,
+            count: 0,
+            kind: callKind(call)
+          });
+        }
+        edges.get(key).count += 1;
+      }
+      return [...edges.values()].sort((left, right) => right.count - left.count);
+    }
+
+    function nodeDepthsForSubset(nodes, calls, maxColumns) {
+      const nodeIds = new Set(nodes.map((node) => node.id));
+      const outgoing = new Map(nodes.map((node) => [node.id, []]));
+      for (const call of calls) {
+        if (nodeIds.has(call.caller) && nodeIds.has(call.callee)) {
+          outgoing.get(call.caller).push(call.callee);
+        }
+      }
+      const preferredIds = nodes
+        .filter((node) => entrypointRankForFunction(node) < 1000000)
+        .map((node) => node.id);
+      return flowDepthsFromOutgoing([...nodeIds], outgoing, (id) => state.functions.get(id)?.file || id, maxColumns, preferredIds);
+    }
+
+    function fileFlowDepths(fileLayouts, calls) {
+      const fileIds = fileLayouts.map((file) => file.file);
+      const files = new Set(fileIds);
+      const outgoing = new Map(fileIds.map((file) => [file, []]));
+      for (const call of calls) {
+        const callerFile = state.functions.get(call.caller)?.file;
+        const calleeFile = state.functions.get(call.callee)?.file;
+        if (!callerFile || !calleeFile || callerFile === calleeFile || !files.has(callerFile) || !files.has(calleeFile)) {
+          continue;
+        }
+        outgoing.get(callerFile).push(calleeFile);
+      }
+      const maxColumns = Math.max(4, Math.min(20, Math.ceil(Math.sqrt(fileLayouts.length * 1.2))));
+      const preferredFiles = fileLayouts
+        .filter((file) => file.entryRank < 1000000 || isEntrypointFile(file.file))
+        .map((file) => file.file);
+      return flowDepthsFromOutgoing(fileIds, outgoing, (id) => id, maxColumns, preferredFiles);
+    }
+
+    function flowDepthsFromOutgoing(ids, outgoing, labelForId, maxColumns, preferredIds = []) {
+      const idSet = new Set(ids);
+      const incomingCount = new Map(ids.map((id) => [id, 0]));
+      for (const id of ids) {
+        outgoing.set(id, (outgoing.get(id) || []).filter((target) => idSet.has(target)));
+        for (const target of outgoing.get(id)) {
+          incomingCount.set(target, (incomingCount.get(target) || 0) + 1);
+        }
+      }
+
+      const components = stronglyConnectedComponents(ids, outgoing);
+      const componentById = new Map();
+      components.forEach((component, index) => {
+        component.forEach((id) => componentById.set(id, index));
+      });
+
+      const componentData = components.map((componentIds, index) => ({
+        id: index,
+        ids: componentIds,
+        outgoing: new Set(),
+        incoming: new Set(),
+        weight: componentIds.reduce((total, id) => total + (outgoing.get(id)?.length || 0) + (incomingCount.get(id) || 0), 0),
+        entryRank: Math.min(...componentIds.map(entrypointRankForId)),
+        firstFile: componentIds.map(labelForId).sort()[0] || ""
+      }));
+
+      const dagEdges = new Set();
+      for (const id of ids) {
+        const caller = componentById.get(id);
+        for (const target of outgoing.get(id) || []) {
+          const callee = componentById.get(target);
+          if (caller === undefined || callee === undefined || caller === callee) {
+            continue;
+          }
+          const key = `${caller}->${callee}`;
+          if (dagEdges.has(key)) {
+            continue;
+          }
+          dagEdges.add(key);
+          componentData[caller].outgoing.add(callee);
+          componentData[callee].incoming.add(caller);
+        }
+      }
+
+      const preferredComponents = new Set(
+        preferredIds
+          .map((id) => componentById.get(id))
+          .filter((id) => id !== undefined)
+      );
+      const componentDepth = componentFlowDepths(componentData, preferredComponents);
+      const rawMaxDepth = Math.max(0, ...componentDepth.values());
+      const depthById = new Map();
+      for (const id of ids) {
+        const component = componentById.get(id);
+        const depth = componentDepth.get(component) || 0;
+        depthById.set(id, rawMaxDepth < maxColumns ? depth : Math.round((depth / rawMaxDepth) * (maxColumns - 1)));
+      }
+
+      return depthById;
+    }
+
+    function compareFileLayouts(left, right) {
+      return left.entryRank - right.entryRank
+        || Number(isEntrypointFile(right.file)) - Number(isEntrypointFile(left.file))
+        || right.weight - left.weight
+        || right.nodes.length - left.nodes.length
+        || left.file.localeCompare(right.file);
+    }
+
+    function compareFunctions(left, right) {
+      return entrypointRankForFunction(left) - entrypointRankForFunction(right)
+        || left.file.localeCompare(right.file)
+        || left.line - right.line
+        || left.name.localeCompare(right.name)
+        || left.id.localeCompare(right.id);
+    }
+
+    function entrypointRankForFunction(item) {
+      const name = String(item?.name || "").toLowerCase();
+      if (name === "main") {
+        return 0;
+      }
+      if (isEntrypointFile(item?.file || "") && /^run(_|$)/.test(name)) {
+        return 1;
+      }
+      return 1000000;
+    }
+
+    function entrypointRankForId(id) {
+      const item = state.functions.get(id);
+      if (item) {
+        return entrypointRankForFunction(item);
+      }
+      return isEntrypointFile(id) ? 0 : 1000000;
+    }
+
+    function isEntrypointFile(file) {
+      const value = String(file || "");
+      return /(^|\/)main\.(rs|go)$/.test(value) || /(^|\/)(cmd|bin)\//.test(value);
+    }
+
+    function stronglyConnectedComponents(nodeIds, outgoing) {
+      let nextIndex = 0;
+      const stack = [];
+      const onStack = new Set();
+      const indexById = new Map();
+      const lowLink = new Map();
+      const components = [];
+
+      function visit(id) {
+        indexById.set(id, nextIndex);
+        lowLink.set(id, nextIndex);
+        nextIndex += 1;
+        stack.push(id);
+        onStack.add(id);
+
+        for (const target of outgoing.get(id) || []) {
+          if (!indexById.has(target)) {
+            visit(target);
+            lowLink.set(id, Math.min(lowLink.get(id), lowLink.get(target)));
+          } else if (onStack.has(target)) {
+            lowLink.set(id, Math.min(lowLink.get(id), indexById.get(target)));
+          }
+        }
+
+        if (lowLink.get(id) !== indexById.get(id)) {
+          return;
+        }
+
+        const component = [];
+        while (stack.length) {
+          const current = stack.pop();
+          onStack.delete(current);
+          component.push(current);
+          if (current === id) {
+            break;
+          }
+        }
+        components.push(component);
+      }
+
+      for (const id of nodeIds) {
+        if (!indexById.has(id)) {
+          visit(id);
+        }
+      }
+
+      return components;
+    }
+
+    function componentFlowDepths(components, preferredComponents = new Set()) {
+      const depth = new Map(components.map((component) => [component.id, Number.POSITIVE_INFINITY]));
+
+      function maxFiniteDepth() {
+        return Math.max(0, ...[...depth.values()].filter(Number.isFinite));
+      }
+
+      function seedDepth(roots, baseDepth, updateReached) {
+        const queue = [];
+        for (const root of roots) {
+          if (!root) {
+            continue;
+          }
+          if (updateReached || !Number.isFinite(depth.get(root.id))) {
+            depth.set(root.id, baseDepth);
+            queue.push(root);
+          }
+        }
+
+        for (let cursor = 0; cursor < queue.length; cursor += 1) {
+          const component = queue[cursor];
+          const nextDepth = (depth.get(component.id) || 0) + 1;
+          const targets = [...component.outgoing].map((id) => components[id]).sort(compareComponents);
+          for (const target of targets) {
+            if (!target) {
+              continue;
+            }
+            const current = depth.get(target.id);
+            if (updateReached) {
+              if (!Number.isFinite(current) || nextDepth > current) {
+                depth.set(target.id, nextDepth);
+                queue.push(target);
+              }
+            } else if (!Number.isFinite(current)) {
+              depth.set(target.id, nextDepth);
+              queue.push(target);
+            }
+          }
+        }
+      }
+
+      const preferredRoots = components
+        .filter((component) => preferredComponents.has(component.id))
+        .sort(compareComponents);
+      if (preferredRoots.length) {
+        seedDepth(preferredRoots, 0, true);
+      }
+
+      const secondaryBase = preferredRoots.length ? maxFiniteDepth() + 1 : 0;
+      const secondaryRoots = components
+        .filter((component) => !Number.isFinite(depth.get(component.id)) && component.incoming.size === 0)
+        .sort(compareComponents);
+      seedDepth(secondaryRoots, secondaryBase, false);
+
+      const tailBase = maxFiniteDepth() + 1;
+      const remaining = components
+        .filter((component) => !Number.isFinite(depth.get(component.id)))
+        .sort(compareComponents);
+      seedDepth(remaining, tailBase, false);
+
+      for (const component of components) {
+        if (!Number.isFinite(depth.get(component.id))) {
+          depth.set(component.id, 0);
+        }
+      }
+
+      return depth;
+    }
+
+    function compareComponents(left, right) {
+      return left.entryRank - right.entryRank
+        || right.weight - left.weight
+        || left.firstFile.localeCompare(right.firstFile)
+        || left.id - right.id;
+    }
+
+    function orderLayersByNeighborhood(layerEntries, calls) {
+      const layerByNode = new Map();
+      layerEntries.forEach(([layerIndex, layer]) => {
+        layer.forEach((node) => layerByNode.set(node.id, layerIndex));
+      });
+
+      const previousNeighbors = new Map();
+      const nextNeighbors = new Map();
+      for (const call of calls) {
+        const callerLayer = layerByNode.get(call.caller);
+        const calleeLayer = layerByNode.get(call.callee);
+        if (callerLayer === undefined || calleeLayer === undefined || callerLayer === calleeLayer) {
+          continue;
+        }
+        if (callerLayer < calleeLayer) {
+          appendNeighbor(nextNeighbors, call.caller, call.callee);
+          appendNeighbor(previousNeighbors, call.callee, call.caller);
+        } else {
+          appendNeighbor(previousNeighbors, call.caller, call.callee);
+          appendNeighbor(nextNeighbors, call.callee, call.caller);
+        }
+      }
+
+      const order = new Map();
+      layerEntries.forEach(([, layer]) => {
+        layer.sort(compareFunctions);
+        layer.forEach((node, index) => order.set(node.id, index));
+      });
+
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (const [, layer] of layerEntries) {
+          layer.sort((left, right) =>
+            neighborOrder(left.id, previousNeighbors, order)
+            - neighborOrder(right.id, previousNeighbors, order)
+            || compareFunctions(left, right)
+          );
+          layer.forEach((node, index) => order.set(node.id, index));
+        }
+
+        for (const [, layer] of [...layerEntries].reverse()) {
+          layer.sort((left, right) =>
+            neighborOrder(left.id, nextNeighbors, order)
+            - neighborOrder(right.id, nextNeighbors, order)
+            || compareFunctions(left, right)
+          );
+          layer.forEach((node, index) => order.set(node.id, index));
+        }
+      }
+    }
+
+    function appendNeighbor(map, id, neighbor) {
+      if (!map.has(id)) {
+        map.set(id, []);
+      }
+      map.get(id).push(neighbor);
+    }
+
+    function neighborOrder(id, neighborsById, order) {
+      const neighbors = neighborsById.get(id) || [];
+      if (!neighbors.length) {
+        return Number.POSITIVE_INFINITY;
+      }
+      let total = 0;
+      for (const neighbor of neighbors) {
+        total += order.get(neighbor) || 0;
+      }
+      return total / neighbors.length;
     }
 
     function resizeCanvasForDisplay(canvasElement) {
@@ -1997,6 +2511,63 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const x = point.x * view.scale + view.offsetX;
       const y = point.y * view.scale + view.offsetY;
       return x >= -padding && x <= width + padding && y >= -padding && y <= height + padding;
+    }
+
+    function visibleCanvasRect(rect, width, height, padding = 220) {
+      const left = rect.x * view.scale + view.offsetX;
+      const top = rect.y * view.scale + view.offsetY;
+      const right = left + rect.width * view.scale;
+      const bottom = top + rect.height * view.scale;
+      return right >= -padding && left <= width + padding && bottom >= -padding && top <= height + padding;
+    }
+
+    function visibleScreenCurve(curve, width, height, padding = 260) {
+      const minX = Math.min(curve.startX, curve.controlX1, curve.controlX2, curve.endX);
+      const maxX = Math.max(curve.startX, curve.controlX1, curve.controlX2, curve.endX);
+      const minY = Math.min(curve.startY, curve.controlY1, curve.controlY2, curve.endY);
+      const maxY = Math.max(curve.startY, curve.controlY1, curve.controlY2, curve.endY);
+      return maxX >= -padding && minX <= width + padding && maxY >= -padding && minY <= height + padding;
+    }
+
+    function canvasCallCurve(caller, callee) {
+      const startX = caller.x * view.scale + view.offsetX;
+      const startY = caller.y * view.scale + view.offsetY;
+      const endX = callee.x * view.scale + view.offsetX;
+      const endY = callee.y * view.scale + view.offsetY;
+      const deltaX = endX - startX;
+      const direction = deltaX >= 0 ? 1 : -1;
+      if (Math.abs(deltaX) < 18 * view.scale) {
+        const loop = 78 * view.scale;
+        return {
+          startX,
+          startY,
+          controlX1: startX + loop,
+          controlY1: startY,
+          controlX2: endX + loop,
+          controlY2: endY,
+          endX,
+          endY
+        };
+      }
+
+      const curve = Math.max(38 * view.scale, Math.abs(deltaX) * 0.42);
+      return {
+        startX,
+        startY,
+        controlX1: startX + direction * curve,
+        controlY1: startY,
+        controlX2: endX - direction * curve,
+        controlY2: endY,
+        endX,
+        endY
+      };
+    }
+
+    function strokeScreenCurve(context, curve) {
+      context.beginPath();
+      context.moveTo(curve.startX, curve.startY);
+      context.bezierCurveTo(curve.controlX1, curve.controlY1, curve.controlX2, curve.controlY2, curve.endX, curve.endY);
+      context.stroke();
     }
 
     function canvasCallColor(kind) {
@@ -2143,65 +2714,223 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return group.functionIds.some((id) => nodeMatchesQuery(id, query));
     }
 
-    function drawCanvasGraph() {
-      const renderer = state.canvasRenderer;
-      if (!renderer?.canvas) {
+    function drawCanvasFlowGuides(context, width, height, renderer) {
+      const columns = renderer.flowColumns || [];
+      if (!columns.length) {
         return;
       }
 
-      const { context, width, height } = resizeCanvasForDisplay(renderer.canvas);
-      context.clearRect(0, 0, width, height);
-      context.fillStyle = "#dde5f4";
-      context.fillRect(0, 0, width, height);
+      context.save();
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      for (const column of columns) {
+        const columnWidth = column.width || renderer.nodeWidth;
+        const bandLeft = (column.x - columnWidth / 2 - 18) * view.scale + view.offsetX;
+        const bandWidth = (columnWidth + 36) * view.scale;
+        if (bandLeft > width || bandLeft + bandWidth < 0) {
+          continue;
+        }
 
-      const groupMode = activeGroupMode();
-      if (groupMode) {
-        drawCanvasGroupGraph(context, width, height, groupGraph(groupMode));
+        context.globalAlpha = 1;
+        context.fillStyle = column.index % 2 === 0 ? "rgba(255, 255, 255, 0.18)" : "rgba(29, 111, 143, 0.06)";
+        context.fillRect(bandLeft, 0, Math.max(1, bandWidth), height);
+
+        if (view.scale >= 0.35) {
+          const labelY = 34 * view.scale + view.offsetY;
+          if (labelY >= -20 && labelY <= height + 20) {
+            context.fillStyle = "rgba(83, 96, 112, 0.88)";
+            context.font = `700 ${Math.max(9, 11 * view.scale)}px Helvetica, Arial, sans-serif`;
+            context.fillText(`depth ${column.index} (${column.count})`, column.x * view.scale + view.offsetX, labelY);
+          }
+        }
+      }
+      context.restore();
+    }
+
+    function drawCanvasFileClusters(context, width, height, renderer) {
+      const clusters = renderer.fileClusters || [];
+      if (!clusters.length) {
+        return;
+      }
+
+      const isolated = neighborhood();
+      context.save();
+      for (const cluster of clusters) {
+        if (isolated && !cluster.functionIds.some((id) => isolated.has(id))) {
+          continue;
+        }
+        if (!cluster.functionIds.some((id) => nodeBaseVisible(id))) {
+          continue;
+        }
+        if (!visibleCanvasRect(cluster, width, height)) {
+          continue;
+        }
+
+        const x = cluster.x * view.scale + view.offsetX;
+        const y = cluster.y * view.scale + view.offsetY;
+        const clusterWidth = cluster.width * view.scale;
+        const clusterHeight = cluster.height * view.scale;
+        const radius = 4 * view.scale;
+
+        context.globalAlpha = 0.5;
+        context.fillStyle = fileColor(cluster.file);
+        roundedRect(context, x, y, clusterWidth, clusterHeight, radius);
+        context.fill();
+
+        context.globalAlpha = 0.82;
+        context.strokeStyle = "#333333";
+        context.lineWidth = Math.max(0.8, 1.1 * view.scale);
+        context.stroke();
+
+        if (view.scale >= 0.26) {
+          context.globalAlpha = 0.94;
+          context.fillStyle = "#10131a";
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.font = `700 ${Math.max(8, 12 * view.scale)}px Helvetica, Arial, sans-serif`;
+          const label = cluster.label.length > 42 ? `${cluster.label.slice(0, 41)}...` : cluster.label;
+          context.fillText(label, x + clusterWidth / 2, y + 16 * view.scale, clusterWidth - 24 * view.scale);
+          if (view.scale >= 0.42) {
+            context.fillStyle = "#536070";
+            context.font = `${Math.max(7, 10 * view.scale)}px Helvetica, Arial, sans-serif`;
+            context.fillText(
+              `${cluster.functionCount} funcs / ${cluster.internalCalls} internal`,
+              x + clusterWidth / 2,
+              y + 34 * view.scale,
+              clusterWidth - 24 * view.scale
+            );
+          }
+        }
+      }
+      context.restore();
+    }
+
+    function drawCanvasFileEdges(context, width, height, renderer) {
+      const clustersByFile = new Map((renderer.fileClusters || []).map((cluster) => [cluster.file, cluster]));
+      const query = filter.value.trim().toLowerCase();
+
+      context.save();
+      context.lineCap = "round";
+      for (const edge of renderer.fileEdges || []) {
+        const caller = clustersByFile.get(edge.caller);
+        const callee = clustersByFile.get(edge.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        if (!caller.functionIds.some((id) => nodeBaseVisible(id)) || !callee.functionIds.some((id) => nodeBaseVisible(id))) {
+          continue;
+        }
+        const dim = query && !caller.label.toLowerCase().includes(query) && !callee.label.toLowerCase().includes(query);
+        const startX = (caller.x + caller.width) * view.scale + view.offsetX;
+        const startY = (caller.y + caller.height / 2) * view.scale + view.offsetY;
+        const endX = callee.x * view.scale + view.offsetX;
+        const endY = (callee.y + callee.height / 2) * view.scale + view.offsetY;
+        const deltaX = endX - startX;
+        const direction = deltaX >= 0 ? 1 : -1;
+        const bend = Math.max(44 * view.scale, Math.abs(deltaX) * 0.38);
+        const curve = {
+          startX,
+          startY,
+          controlX1: startX + direction * bend,
+          controlY1: startY,
+          controlX2: endX - direction * bend,
+          controlY2: endY,
+          endX,
+          endY
+        };
+        if (!visibleScreenCurve(curve, width, height, 360)) {
+          continue;
+        }
+
+        context.globalAlpha = dim ? 0.08 : 0.32;
+        context.strokeStyle = canvasCallColor(edge.kind);
+        context.lineWidth = Math.max(0.8, Math.min(7, Math.log2(edge.count + 1)) * Math.max(0.45, view.scale));
+        context.setLineDash(edge.kind === "method" ? [6, 4] : edge.kind === "unknown" ? [2, 4] : []);
+        strokeScreenCurve(context, curve);
+      }
+      context.restore();
+    }
+
+    function drawCanvasIsolatedCalls(context, width, height, renderer) {
+      const isolated = neighborhood();
+      if (!isolated) {
         return;
       }
 
       const query = filter.value.trim().toLowerCase();
-      const isolated = neighborhood();
-      let drawnEdges = 0;
+      context.save();
       context.lineCap = "round";
-
-      for (const call of state.graph.calls) {
-        if (drawnEdges >= renderer.edgeBudget && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+      for (const call of selectedNeighborhoodCalls()) {
+        if (!edgeBaseVisible(call, call.caller, call.callee) || !edgeMatchesQuery(call, call.caller, call.callee, query)) {
           continue;
         }
-
         const caller = renderer.positions.get(call.caller);
         const callee = renderer.positions.get(call.callee);
         if (!caller || !callee) {
           continue;
         }
-        if (!visibleCanvasPoint(caller, width, height) && !visibleCanvasPoint(callee, width, height)) {
-          continue;
-        }
-        if (!edgeBaseVisible(call, call.caller, call.callee)) {
-          continue;
-        }
-
-        const dim = !edgePassesPreset(call, call.caller, call.callee)
-          || !edgeMatchesQuery(call, call.caller, call.callee, query)
-          || (isolated && !(isolated.has(call.caller) && isolated.has(call.callee)));
-        if (dim && view.scale < 0.45 && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+        const curve = canvasCallCurve(caller, callee);
+        if (!visibleScreenCurve(curve, width, height, 360)) {
           continue;
         }
 
-        context.globalAlpha = dim ? 0.12 : 0.42;
-        context.strokeStyle = canvasCallColor(callKind(call));
-        context.lineWidth = Math.max(0.65, view.scale * 1.2);
+        const selected = edgeKey(call) === state.selectedEdge;
+        context.globalAlpha = selected ? 1 : 0.82;
+        context.strokeStyle = selected ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.lineWidth = selected ? Math.max(1.8, view.scale * 2.8) : Math.max(1.2, view.scale * 1.8);
         context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
-        context.beginPath();
-        context.moveTo(caller.x * view.scale + view.offsetX, caller.y * view.scale + view.offsetY);
-        context.lineTo(callee.x * view.scale + view.offsetX, callee.y * view.scale + view.offsetY);
-        context.stroke();
-        drawnEdges += 1;
+        strokeScreenCurve(context, curve);
       }
-      context.setLineDash([]);
+      context.restore();
+    }
 
+    function selectedNeighborhoodCalls() {
+      if (!state.isolate || !state.selectedNode) {
+        return [];
+      }
+      return [
+        ...(state.incoming.get(state.selectedNode) || []),
+        ...(state.outgoing.get(state.selectedNode) || [])
+      ];
+    }
+
+    function drawCanvasNodeDots(context, width, height, renderer) {
+      const query = filter.value.trim().toLowerCase();
+      const isolated = neighborhood();
+      const dotSize = view.scale < 0.22 ? 2 : 3;
+
+      context.save();
       for (const [id, point] of renderer.positions) {
+        if (isolated && !isolated.has(id)) {
+          continue;
+        }
+        if (!nodeBaseVisible(id) || !visibleCanvasPoint(point, width, height, 80)) {
+          continue;
+        }
+        const dim = !passesPreset(id)
+          || !nodeMatchesQuery(id, query)
+          || (isolated && !isolated.has(id));
+        const x = point.x * view.scale + view.offsetX;
+        const y = point.y * view.scale + view.offsetY;
+        const selected = id === state.selectedNode;
+
+        context.globalAlpha = selected ? 1 : dim ? 0.12 : 0.72;
+        context.fillStyle = selected ? "#d12f1f" : "#10131a";
+        context.fillRect(x - dotSize / 2, y - dotSize / 2, dotSize, dotSize);
+      }
+      context.restore();
+    }
+
+    function drawCanvasCallEdge(context, caller, callee) {
+      strokeScreenCurve(context, canvasCallCurve(caller, callee));
+    }
+
+    function drawCanvasFunctionNodes(context, width, height, renderer, isolated) {
+      const query = filter.value.trim().toLowerCase();
+      for (const [id, point] of renderer.positions) {
+        if (isolated && !isolated.has(id)) {
+          continue;
+        }
         if (!visibleCanvasPoint(point, width, height)) {
           continue;
         }
@@ -2219,7 +2948,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         const nodeHeight = renderer.nodeHeight * view.scale;
 
         context.globalAlpha = dim ? 0.16 : 1;
-        context.fillStyle = fileColor(item?.file || "");
+        context.fillStyle = "#b9e1ea";
         context.strokeStyle = id === state.selectedNode ? "#d12f1f" : "#111111";
         context.lineWidth = id === state.selectedNode ? Math.max(2, view.scale * 3) : Math.max(1, view.scale * 1.4);
         context.beginPath();
@@ -2242,6 +2971,84 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           }
         }
       }
+    }
+
+    function drawCanvasGraph() {
+      const renderer = state.canvasRenderer;
+      if (!renderer?.canvas) {
+        return;
+      }
+
+      const { context, width, height } = resizeCanvasForDisplay(renderer.canvas);
+      context.clearRect(0, 0, width, height);
+      context.fillStyle = "#dde5f4";
+      context.fillRect(0, 0, width, height);
+
+      const groupMode = activeGroupMode();
+      if (groupMode) {
+        drawCanvasGroupGraph(context, width, height, groupGraph(groupMode));
+        return;
+      }
+      drawCanvasFlowGuides(context, width, height, renderer);
+      drawCanvasFileClusters(context, width, height, renderer);
+
+      if (view.scale < 0.38) {
+        if (state.isolate && state.selectedNode) {
+          drawCanvasIsolatedCalls(context, width, height, renderer);
+        } else {
+          drawCanvasFileEdges(context, width, height, renderer);
+        }
+        drawCanvasNodeDots(context, width, height, renderer);
+        context.globalAlpha = 1;
+        return;
+      }
+
+      const query = filter.value.trim().toLowerCase();
+      const isolated = neighborhood();
+      if (isolated) {
+        drawCanvasIsolatedCalls(context, width, height, renderer);
+        drawCanvasFunctionNodes(context, width, height, renderer, isolated);
+        context.globalAlpha = 1;
+        return;
+      }
+
+      let drawnEdges = 0;
+      context.lineCap = "round";
+
+      for (const call of state.graph.calls) {
+        if (drawnEdges >= renderer.edgeBudget && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+          continue;
+        }
+
+        const caller = renderer.positions.get(call.caller);
+        const callee = renderer.positions.get(call.callee);
+        if (!caller || !callee) {
+          continue;
+        }
+        const curve = canvasCallCurve(caller, callee);
+        if (!visibleScreenCurve(curve, width, height, 320)) {
+          continue;
+        }
+        if (!edgeBaseVisible(call, call.caller, call.callee)) {
+          continue;
+        }
+
+        const dim = !edgePassesPreset(call, call.caller, call.callee)
+          || !edgeMatchesQuery(call, call.caller, call.callee, query);
+        if (dim && view.scale < 0.45 && call.caller !== state.selectedNode && call.callee !== state.selectedNode) {
+          continue;
+        }
+
+        const selected = edgeKey(call) === state.selectedEdge;
+        context.globalAlpha = selected ? 0.9 : dim ? 0.1 : 0.34;
+        context.strokeStyle = canvasCallColor(callKind(call));
+        context.lineWidth = selected ? Math.max(1.4, view.scale * 2.4) : Math.max(0.65, view.scale * 1.05);
+        context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
+        strokeScreenCurve(context, curve);
+        drawnEdges += 1;
+      }
+      context.setLineDash([]);
+      drawCanvasFunctionNodes(context, width, height, renderer, null);
 
       context.globalAlpha = 1;
     }
@@ -2562,5 +3369,16 @@ mod tests {
         assert!(html.contains("search-next"));
         assert!(html.contains("Open in editor"));
         assert!(html.contains("data-source-mode=\"wide\""));
+        assert!(html.contains("stronglyConnectedComponents"));
+        assert!(html.contains("drawCanvasFlowGuides"));
+        assert!(html.contains("drawCanvasFileClusters"));
+        assert!(html.contains("drawCanvasFileEdges"));
+        assert!(html.contains("drawCanvasNodeDots"));
+        assert!(html.contains("packFileLanes"));
+        assert!(html.contains("entrypointRankForFunction"));
+        assert!(html.contains("visibleScreenCurve"));
+        assert!(html.contains("drawCanvasIsolatedCalls"));
+        assert!(html.contains("selectedNeighborhoodCalls"));
+        assert!(html.contains("drawCanvasFunctionNodes"));
     }
 }
