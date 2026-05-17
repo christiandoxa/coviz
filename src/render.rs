@@ -206,19 +206,59 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     main {
+      --controls-width: 19rem;
       --inspector-width: 24rem;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 0.7rem var(--inspector-width);
+      grid-template-columns: var(--controls-width) minmax(0, 1fr) var(--inspector-width);
       gap: 0.65rem;
       height: calc(100vh - 4.1rem);
       padding: 1rem;
     }
 
+    main.hide-controls {
+      --controls-width: 0;
+    }
+
+    main.hide-inspector {
+      --inspector-width: 0;
+    }
+
+    .panel-toggle {
+      display: inline-flex;
+      gap: 0.4rem;
+      align-items: center;
+    }
+
+    .control-panel,
+    .inspector {
+      height: calc(100vh - 6.1rem);
+      overflow: auto;
+      border: 1px solid #6f7888;
+      background: #f6f1e2;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+      padding: 1rem;
+    }
+
+    main.hide-controls .control-panel,
+    main.hide-inspector .inspector {
+      border: 0;
+      overflow: hidden;
+      padding: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+
+    .control-panel h2 {
+      margin: 0 0 0.75rem;
+      font-size: 1.1rem;
+    }
+
     .toolbar {
       display: flex;
-      flex-wrap: wrap;
+      flex-direction: column;
+      flex-wrap: nowrap;
       gap: 0.75rem;
-      align-items: center;
+      align-items: stretch;
       margin-bottom: 1rem;
     }
 
@@ -280,17 +320,10 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       padding: 0.52rem 0.65rem;
     }
 
-    .range-label {
-      color: var(--muted);
-      font-size: 0.86rem;
-      font-weight: 700;
-      min-width: 4.5rem;
-    }
-
     .search-tools {
       display: flex;
-      min-width: min(36rem, 100%);
-      flex: 1 1 28rem;
+      min-width: 0;
+      flex: 0 0 auto;
       gap: 0.35rem;
       align-items: center;
     }
@@ -314,14 +347,17 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     .chips {
       display: flex;
-      flex-wrap: nowrap;
+      flex-wrap: wrap;
       gap: 0.35rem;
-      margin: -0.4rem 0 0.65rem;
+      align-items: center;
+      flex: 0 0 auto;
+      margin: 0 0 0.75rem;
+      min-height: 2.65rem;
       max-width: 100%;
-      overflow-x: auto;
-      padding-bottom: 0.25rem;
-      scrollbar-color: #6f7888 transparent;
-      scrollbar-width: thin;
+      overflow: visible;
+      padding: 0.2rem 0 0.45rem;
+      position: relative;
+      z-index: 2;
     }
 
     .chip {
@@ -588,38 +624,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       min-height: 0;
     }
 
-    .splitter {
-      align-self: stretch;
-      border: 1px solid #6f7888;
-      background:
-        linear-gradient(90deg, transparent 0 35%, #6f7888 35% 45%, transparent 45% 55%, #6f7888 55% 65%, transparent 65% 100%),
-        #c8d1e1;
-      cursor: col-resize;
-      touch-action: none;
-      user-select: none;
-    }
-
-    .splitter:hover,
-    body.resizing .splitter {
-      background:
-        linear-gradient(90deg, transparent 0 35%, #934f12 35% 45%, transparent 45% 55%, #934f12 55% 65%, transparent 65% 100%),
-        #f7c873;
-    }
-
-    body.resizing {
-      cursor: col-resize;
-      user-select: none;
-    }
-
-    .inspector {
-      height: calc(100vh - 6.1rem);
-      overflow: auto;
-      border: 1px solid #6f7888;
-      background: #f6f1e2;
-      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
-      padding: 1rem;
-    }
-
     .inspector h2,
     .inspector h3 {
       margin: 0 0 0.75rem;
@@ -760,10 +764,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         height: auto;
       }
 
-      .splitter {
-        display: none;
-      }
-
       header {
         align-items: start;
         flex-direction: column;
@@ -779,10 +779,15 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 <body>
   <header>
     <h1>coviz quick</h1>
-    <div class="summary">__FUNCTION_COUNT__ functions / __CALL_COUNT__ calls</div>
+    <div class="panel-toggle">
+      <button id="toggle-controls" type="button">Controls</button>
+      <button id="toggle-inspector" type="button">Inspector</button>
+      <div class="summary">__FUNCTION_COUNT__ functions / __CALL_COUNT__ calls</div>
+    </div>
   </header>
   <main>
-    <section class="workspace">
+    <aside id="controls" class="control-panel" aria-label="Controls">
+      <h2>Controls</h2>
       <div class="toolbar">
         <div class="search-tools">
           <input id="filter" type="search" placeholder="Filter function or file" autocomplete="off">
@@ -807,8 +812,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         <div class="toolbar-group">
           <button id="trace-entry" type="button" title="Trace from project entrypoint">Entry flow</button>
           <button id="trace-selected" type="button" title="Trace from selected function">Trace selected</button>
-          <label class="range-label" for="trace-depth">Depth <span id="trace-depth-value">3</span></label>
-          <input id="trace-depth" type="range" min="1" max="12" value="3" title="Trace depth">
         </div>
         <div class="toolbar-group">
           <input id="path-from" class="path-input" type="search" placeholder="Path from" autocomplete="off">
@@ -827,11 +830,12 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         <span class="hint">Wheel zoom / left-drag pan / click inspect / press ? shortcuts</span>
       </div>
       <div id="file-filters" class="chips" aria-label="File filters"></div>
+    </aside>
+    <section class="workspace">
       <section id="canvas" aria-label="Call graph">
         <div class="empty">Loading graph...</div>
       </section>
     </section>
-    <div id="splitter" class="splitter" role="separator" aria-label="Resize inspector" aria-orientation="vertical" title="Drag to resize inspector. Double-click to reset."></div>
     <aside id="inspector" class="inspector" aria-label="Inspector">
       <h2>Inspector</h2>
       <p class="muted">Click a node or edge to inspect calls and source context.</p>
@@ -845,15 +849,15 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     const searchCount = document.querySelector("#search-count");
     const fileFilters = document.querySelector("#file-filters");
     const inspector = document.querySelector("#inspector");
-    const splitter = document.querySelector("#splitter");
+    const mainElement = document.querySelector("main");
+    const toggleControlsButton = document.querySelector("#toggle-controls");
+    const toggleInspectorButton = document.querySelector("#toggle-inspector");
     const resetButton = document.querySelector("#reset-view");
     const isolateButton = document.querySelector("#isolate");
     const hideIsolatedButton = document.querySelector("#hide-isolated");
     const layoutPreset = document.querySelector("#layout-preset");
     const traceEntryButton = document.querySelector("#trace-entry");
     const traceSelectedButton = document.querySelector("#trace-selected");
-    const traceDepthInput = document.querySelector("#trace-depth");
-    const traceDepthValue = document.querySelector("#trace-depth-value");
     const pathFromInput = document.querySelector("#path-from");
     const pathToInput = document.querySelector("#path-to");
     const findPathButton = document.querySelector("#find-path");
@@ -880,7 +884,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       preset: "all",
       entrypointNode: null,
       traceRoot: null,
-      traceDepth: 3,
       traceCache: null,
       pathFrom: null,
       pathTo: null,
@@ -936,21 +939,25 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       return Math.min(max, Math.max(min, value));
     }
 
-    function inspectorMaxWidth() {
-      return Math.max(320, window.innerWidth - 460);
+    function setPanelVisibility(panel, visible) {
+      const key = panel === "controls" ? "hide-controls" : "hide-inspector";
+      mainElement.classList.toggle(key, !visible);
+      localStorage.setItem(`coviz.quick.${panel}Visible`, visible ? "1" : "0");
+      toggleControlsButton.classList.toggle("active", !mainElement.classList.contains("hide-controls"));
+      toggleInspectorButton.classList.toggle("active", !mainElement.classList.contains("hide-inspector"));
+      requestAnimationFrame(() => {
+        if (state.canvasRenderer) {
+          drawCanvasGraph();
+          renderMinimap();
+        } else {
+          updateMinimap();
+        }
+      });
     }
 
-    function setInspectorWidth(width, persist = true) {
-      const nextWidth = clamp(Number(width) || 384, 280, inspectorMaxWidth());
-      document.querySelector("main").style.setProperty("--inspector-width", `${nextWidth}px`);
-      splitter.setAttribute("aria-valuenow", String(Math.round(nextWidth)));
-      if (persist) {
-        localStorage.setItem("coviz.quick.inspectorWidth", String(Math.round(nextWidth)));
-      }
-    }
-
-    function loadInspectorWidth() {
-      setInspectorWidth(localStorage.getItem("coviz.quick.inspectorWidth") || 384, false);
+    function loadPanelVisibility() {
+      setPanelVisibility("controls", localStorage.getItem("coviz.quick.controlsVisible") !== "0");
+      setPanelVisibility("inspector", localStorage.getItem("coviz.quick.inspectorVisible") !== "0");
     }
 
     function edgeKey(call) {
@@ -1015,40 +1022,41 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     function traceGraph() {
       const root = state.traceRoot || state.entrypointNode || defaultEntrypointId();
-      const depthLimit = Number(state.traceDepth) || 3;
-      const cacheKey = `${root}|${depthLimit}`;
+      const cacheKey = `${root}`;
       if (state.traceCache?.key === cacheKey) {
         return state.traceCache;
       }
 
       const nodes = new Set();
       const edges = new Set();
-      const depth = new Map();
+      const limit = 1200;
       if (!root) {
-        state.traceCache = { key: cacheKey, root, nodes, edges, depth };
+        state.traceCache = { key: cacheKey, root, nodes, edges };
         return state.traceCache;
       }
 
       const queue = [root];
       nodes.add(root);
-      depth.set(root, 0);
       for (let cursor = 0; cursor < queue.length; cursor += 1) {
         const id = queue[cursor];
-        const currentDepth = depth.get(id) || 0;
-        if (currentDepth >= depthLimit) {
+        if (nodes.size >= limit) {
           continue;
         }
         for (const call of state.outgoing.get(id) || []) {
-          edges.add(edgeKey(call));
-          nodes.add(call.callee);
-          if (!depth.has(call.callee)) {
-            depth.set(call.callee, currentDepth + 1);
-            queue.push(call.callee);
+          if (nodes.has(call.callee)) {
+            edges.add(edgeKey(call));
+            continue;
           }
+          if (nodes.size >= limit) {
+            continue;
+          }
+          nodes.add(call.callee);
+          edges.add(edgeKey(call));
+          queue.push(call.callee);
         }
       }
 
-      state.traceCache = { key: cacheKey, root, nodes, edges, depth };
+      state.traceCache = { key: cacheKey, root, nodes, edges };
       return state.traceCache;
     }
 
@@ -2031,8 +2039,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       const isolated = neighborhood();
       const hovered = hoverNeighborhood();
       updateSearchMatches(query);
-      traceDepthInput.value = String(state.traceDepth);
-      traceDepthValue.textContent = String(state.traceDepth);
       traceEntryButton.classList.toggle("active", state.preset === "trace" && state.traceRoot === state.entrypointNode);
       traceSelectedButton.classList.toggle("active", state.preset === "trace" && state.selectedNode === state.traceRoot);
       if (state.canvasRenderer) {
@@ -2195,44 +2201,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
 
     canvas.addEventListener("pointerup", stopPanning);
     canvas.addEventListener("pointercancel", stopPanning);
-    splitter.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) {
-        return;
-      }
-
-      event.preventDefault();
-      view.resizeStartX = event.clientX;
-      view.resizeStartWidth = inspector.getBoundingClientRect().width;
-      document.body.classList.add("resizing");
-      splitter.setPointerCapture(event.pointerId);
+    toggleControlsButton.addEventListener("click", () => {
+      setPanelVisibility("controls", mainElement.classList.contains("hide-controls"));
     });
-    splitter.addEventListener("pointermove", (event) => {
-      if (view.resizeStartX === undefined) {
-        return;
-      }
-
-      const deltaX = event.clientX - view.resizeStartX;
-      setInspectorWidth(view.resizeStartWidth - deltaX);
+    toggleInspectorButton.addEventListener("click", () => {
+      setPanelVisibility("inspector", mainElement.classList.contains("hide-inspector"));
     });
-
-    function stopResizing(event) {
-      if (view.resizeStartX === undefined) {
-        return;
-      }
-
-      delete view.resizeStartX;
-      delete view.resizeStartWidth;
-      document.body.classList.remove("resizing");
-      if (splitter.hasPointerCapture(event.pointerId)) {
-        splitter.releasePointerCapture(event.pointerId);
-      }
-    }
-
-    splitter.addEventListener("pointerup", stopResizing);
-    splitter.addEventListener("pointercancel", stopResizing);
-    splitter.addEventListener("dblclick", () => setInspectorWidth(384));
     window.addEventListener("resize", () => {
-      setInspectorWidth(inspector.getBoundingClientRect().width, false);
+      scheduleCanvasDraw();
       updateMinimap();
     });
     filter.addEventListener("input", () => {
@@ -2264,12 +2240,6 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       state.isolate = false;
       setTraceRoot(state.selectedNode || state.entrypointNode || defaultEntrypointId());
       centerNode(state.traceRoot);
-    });
-    traceDepthInput.addEventListener("input", () => {
-      state.traceDepth = Number(traceDepthInput.value) || 3;
-      traceDepthValue.textContent = String(state.traceDepth);
-      invalidateTrace();
-      applyGraphState();
     });
     findPathButton.addEventListener("click", () => {
       const from = findFunctionByQuery(pathFromInput.value) || (state.selectedNode ? state.functions.get(state.selectedNode) : null);
@@ -3135,11 +3105,91 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       };
     }
 
+    function curvePoint(curve, t) {
+      const left = 1 - t;
+      return {
+        x: left * left * left * curve.startX
+          + 3 * left * left * t * curve.controlX1
+          + 3 * left * t * t * curve.controlX2
+          + t * t * t * curve.endX,
+        y: left * left * left * curve.startY
+          + 3 * left * left * t * curve.controlY1
+          + 3 * left * t * t * curve.controlY2
+          + t * t * t * curve.endY
+      };
+    }
+
+    function curveTangent(curve, t) {
+      const left = 1 - t;
+      return {
+        x: 3 * left * left * (curve.controlX1 - curve.startX)
+          + 6 * left * t * (curve.controlX2 - curve.controlX1)
+          + 3 * t * t * (curve.endX - curve.controlX2),
+        y: 3 * left * left * (curve.controlY1 - curve.startY)
+          + 6 * left * t * (curve.controlY2 - curve.controlY1)
+          + 3 * t * t * (curve.endY - curve.controlY2)
+      };
+    }
+
+    function drawCanvasArrowhead(context, curve, color, size = 7) {
+      const point = curvePoint(curve, 0.93);
+      const tangent = curveTangent(curve, 0.93);
+      const angle = Math.atan2(tangent.y, tangent.x);
+      const renderScale = state.isolate ? 1 : view.scale;
+      const length = Math.max(5, Math.min(13, size * Math.max(0.75, renderScale)));
+      const spread = Math.PI / 7;
+
+      context.save();
+      context.fillStyle = color;
+      context.beginPath();
+      context.moveTo(point.x, point.y);
+      context.lineTo(point.x - length * Math.cos(angle - spread), point.y - length * Math.sin(angle - spread));
+      context.lineTo(point.x - length * Math.cos(angle + spread), point.y - length * Math.sin(angle + spread));
+      context.closePath();
+      context.fill();
+      context.restore();
+    }
+
+    function drawCanvasEdgeLabel(context, curve, label, color, alpha = 0.72) {
+      const renderScale = state.isolate ? 1 : view.scale;
+      if (!label || renderScale < 0.74 || canvasInteractionActive()) {
+        return;
+      }
+
+      const point = curvePoint(curve, 0.52);
+      const tangent = curveTangent(curve, 0.52);
+      let angle = Math.atan2(tangent.y, tangent.x);
+      if (angle > Math.PI / 2 || angle < -Math.PI / 2) {
+        angle += Math.PI;
+      }
+
+      context.save();
+      context.globalAlpha = alpha;
+      context.translate(point.x, point.y);
+      context.rotate(angle);
+      context.fillStyle = color;
+      context.textAlign = "center";
+      context.textBaseline = "bottom";
+      context.font = `${Math.max(7, 9 * renderScale)}px Helvetica, Arial, sans-serif`;
+      context.fillText(label, 0, -3 * renderScale);
+      context.restore();
+    }
+
+    function canvasEdgeLabel(call) {
+      return `${call.file}:${call.line}`;
+    }
+
     function strokeScreenCurve(context, curve) {
       context.beginPath();
       context.moveTo(curve.startX, curve.startY);
       context.bezierCurveTo(curve.controlX1, curve.controlY1, curve.controlX2, curve.controlY2, curve.endX, curve.endY);
       context.stroke();
+    }
+
+    function drawCanvasDirectedCurve(context, curve, call, color, labelAlpha = 0.72) {
+      strokeScreenCurve(context, curve);
+      drawCanvasArrowhead(context, curve, color);
+      drawCanvasEdgeLabel(context, curve, canvasEdgeLabel(call), color, labelAlpha);
     }
 
     function canvasCallColor(kind) {
@@ -3444,6 +3494,10 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         );
         context.setLineDash(edge.kind === "method" ? [6, 4] : edge.kind === "unknown" ? [2, 4] : []);
         strokeScreenCurve(context, curve);
+        drawCanvasArrowhead(context, curve, canvasCallColor(edge.kind), highlighted ? 8 : 6);
+        if (view.scale >= 0.68 && !canvasInteractionActive()) {
+          drawCanvasEdgeLabel(context, curve, `${edge.count} calls`, canvasCallColor(edge.kind), highlighted ? 0.82 : 0.52);
+        }
       }
       context.restore();
     }
@@ -3467,16 +3521,14 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
           continue;
         }
         const curve = canvasCallCurve(caller, callee);
-        if (!visibleScreenCurve(curve, width, height, 360)) {
-          continue;
-        }
 
         const selected = edgeKey(call) === state.selectedEdge;
         context.globalAlpha = selected ? 1 : 0.82;
-        context.strokeStyle = selected ? "#d12f1f" : canvasCallColor(callKind(call));
+        const color = selected ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.strokeStyle = color;
         context.lineWidth = selected ? Math.max(1.8, view.scale * 2.8) : Math.max(1.2, view.scale * 1.8);
         context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
-        strokeScreenCurve(context, curve);
+        drawCanvasDirectedCurve(context, curve, call, color, selected ? 1 : 0.82);
       }
       context.restore();
     }
@@ -3519,10 +3571,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         const dim = !edgeMatchesQuery(call, call.caller, call.callee, query);
         const strong = selected || path;
         context.globalAlpha = strong ? 0.94 : dim ? 0.18 : traceEdge ? 0.58 : 0.5;
-        context.strokeStyle = strong ? "#d12f1f" : canvasCallColor(callKind(call));
+        const color = strong ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.strokeStyle = color;
         context.lineWidth = strong ? Math.max(1.8, view.scale * 3) : Math.max(1.1, view.scale * 1.9);
         context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
-        strokeScreenCurve(context, curve);
+        drawCanvasDirectedCurve(context, curve, call, color, strong ? 1 : 0.72);
         drawn += 1;
       }
       context.restore();
@@ -3584,7 +3637,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         if (isolated && !isolated.has(id)) {
           continue;
         }
-        if (!visibleCanvasPoint(point, width, height)) {
+        if (!isolated && !visibleCanvasPoint(point, width, height)) {
           continue;
         }
         const visible = isolated ? nodeBaseVisible(id) : nodeDisplayVisible(id);
@@ -3632,6 +3685,10 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
     }
 
     function drawCanvasNodesByLod(context, width, height, renderer, isolated = null) {
+      if (isolated) {
+        drawCanvasFunctionNodes(context, width, height, renderer, isolated);
+        return;
+      }
       if (canvasInteractionActive() || view.scale < 0.62) {
         drawCanvasNodeDots(context, width, height, renderer);
         return;
@@ -3671,27 +3728,30 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         drawCanvasGroupGraph(context, width, height, groupGraph(groupMode));
         return;
       }
+
+      const isolated = neighborhood();
       drawCanvasFlowGuides(context, width, height, renderer);
       drawCanvasFileClusters(context, width, height, renderer);
 
       if (view.scale < 0.38) {
         if (state.isolate && state.selectedNode) {
           drawCanvasIsolatedCalls(context, width, height, renderer);
+          drawCanvasFunctionNodes(context, width, height, renderer, isolated);
         } else if (state.preset === "trace") {
           drawCanvasHighlightedCalls(context, width, height, renderer, true);
+          drawCanvasNodeDots(context, width, height, renderer);
         } else {
           drawCanvasFileEdges(context, width, height, renderer);
           if (hasFocusedCanvasCalls()) {
             drawCanvasHighlightedCalls(context, width, height, renderer, false);
           }
+          drawCanvasNodeDots(context, width, height, renderer);
         }
-        drawCanvasNodeDots(context, width, height, renderer);
         context.globalAlpha = 1;
         return;
       }
 
       const query = filter.value.trim().toLowerCase();
-      const isolated = neighborhood();
       const hovered = hoverNeighborhood();
       if (isolated) {
         drawCanvasIsolatedCalls(context, width, height, renderer);
@@ -3761,10 +3821,11 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
         }
 
         context.globalAlpha = selected || path ? 0.92 : dim ? 0.08 : traceEdge ? 0.48 : important ? 0.44 : 0.28;
-        context.strokeStyle = selected || path ? "#d12f1f" : canvasCallColor(callKind(call));
+        const color = selected || path ? "#d12f1f" : canvasCallColor(callKind(call));
+        context.strokeStyle = color;
         context.lineWidth = selected || path ? Math.max(1.8, view.scale * 3) : important ? Math.max(1, view.scale * 1.6) : Math.max(0.65, view.scale * 1.05);
         context.setLineDash(callKind(call) === "method" ? [6, 4] : callKind(call) === "unknown" ? [2, 4] : []);
-        strokeScreenCurve(context, curve);
+        drawCanvasDirectedCurve(context, curve, call, color, selected || path || important ? 0.86 : 0.5);
         drawnEdges += 1;
       }
       context.setLineDash([]);
@@ -4047,7 +4108,7 @@ const QUICK_VIEWER_TEMPLATE: &str = r##"<!doctype html>
       fetchJson("/source.json").catch(() => ({ functions: [] }))
     ])
       .then(([graph, source]) => {
-        loadInspectorWidth();
+        loadPanelVisibility();
         initData(graph, source);
         renderHome();
         return renderSvg().catch(() => fallbackDraw(graph));
@@ -4099,8 +4160,10 @@ mod tests {
         assert!(html.contains("graph-viewport"));
         assert!(html.contains("source.json"));
         assert!(html.contains("Inspector"));
-        assert!(html.contains("Resize inspector"));
-        assert!(html.contains("coviz.quick.inspectorWidth"));
+        assert!(html.contains("toggle-controls"));
+        assert!(html.contains("control-panel"));
+        assert!(html.contains("coviz.quick.controlsVisible"));
+        assert!(html.contains("coviz.quick.inspectorVisible"));
         assert!(html.contains("Graph minimap"));
         assert!(html.contains("Hide isolated"));
         assert!(html.contains("layout-preset"));
